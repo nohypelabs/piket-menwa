@@ -1,7 +1,8 @@
 import { useEffect, useState } from 'react';
+import { AnimatePresence, motion } from 'framer-motion';
 import {
-  isOnline, loadAttendance, loadChecks, loadEvidence, loadFaces, loadLapsit,
-  loadState, superGet, verifySuper,
+  deleteMember, isOnline, loadAttendance, loadChecks, loadEvidence, loadFaces,
+  loadLapsit, loadState, superGet, verifySuper,
   type AppState, type AttRow, type EvidenceRow, type FaceRow, type FeedItem,
   type LapsitRow, type Overview, type SwapRow, type TaskRow,
 } from './api';
@@ -24,6 +25,22 @@ export default function SuperView({ onExit }: { onExit: () => void }) {
   const [checks, setChecks] = useState<TaskRow[]>([]);
   const [swaps, setSwaps] = useState<SwapRow[]>([]);
   const [preview, setPreview] = useState<string | null>(null);
+  const [lbFrom, setLbFrom] = useState(() => dateStr(0).slice(0, 8) + '01');
+  const [lbTo, setLbTo] = useState(() => dateStr(0));
+  const [lb, setLb] = useState<{ memberId: string; nama: string; n: number; rata2: number | null }[]>([]);
+
+  const reloadMembers = async () => {
+    const s = await loadState();
+    setState(s);
+    setFaces(await loadFaces());
+  };
+
+  const hapus = async (id: string, nama_: string) => {
+    if (!confirm(`Hapus ${nama_} + wajah, foto & jadwalnya?`)) return;
+    const ok = await deleteMember(id);
+    if (!ok) return alert('Gagal hapus (PIN superadmin / online).');
+    void reloadMembers();
+  };
 
   const submitPin = async () => {
     const r = await verifySuper(pin);
@@ -54,9 +71,42 @@ export default function SuperView({ onExit }: { onExit: () => void }) {
     })();
   }, [ok, date]);
 
+  useEffect(() => {
+    if (!ok) return;
+    (async () => {
+      const s = await loadState();
+      const mems = s?.members ?? [];
+      const r = await superGet<{ rows: { memberId: string; nilai: number | null }[] }>(
+        `/api/nilai/rekap?from=${lbFrom}&to=${lbTo}`,
+      );
+      if (!r) return;
+      const by: Record<string, { nama: string; vals: number[] }> = {};
+      for (const row of r.rows) {
+        const m = mems.find((x) => x.id === row.memberId);
+        const e = (by[row.memberId] ??= { nama: m?.nama ?? row.memberId, vals: [] });
+        if (typeof row.nilai === 'number') e.vals.push(row.nilai);
+      }
+      setLb(
+        Object.entries(by)
+          .map(([memberId, v]) => ({
+            memberId,
+            nama: v.nama,
+            n: v.vals.length,
+            rata2: v.vals.length ? Math.round((v.vals.reduce((a, n) => a + n, 0) / v.vals.length) * 100) / 100 : null,
+          }))
+          .sort((a, b) => (b.rata2 ?? -1) - (a.rata2 ?? -1)),
+      );
+    })();
+  }, [ok, lbFrom, lbTo]);
+
   if (!ok) {
     return (
-      <div className="super">
+      <motion.div
+        className="super"
+        initial={{ opacity: 0, y: 14 }}
+        animate={{ opacity: 1, y: 0 }}
+        transition={{ duration: 0.25, ease: 'easeOut' }}
+      >
         <h1>Superadmin</h1>
         <p className="hint">Khusus dev — monitoring seluruh data.</p>
         <input
@@ -68,7 +118,7 @@ export default function SuperView({ onExit }: { onExit: () => void }) {
           <button className="primary" onClick={submitPin}>Masuk</button>
           <button onClick={onExit}>Tutup</button>
         </div>
-      </div>
+      </motion.div>
     );
   }
 
@@ -84,20 +134,52 @@ export default function SuperView({ onExit }: { onExit: () => void }) {
   ];
 
   return (
-    <div className="super">
+    <motion.div
+      className="super"
+      initial={{ opacity: 0 }}
+      animate={{ opacity: 1 }}
+      transition={{ duration: 0.25 }}
+    >
       <div className="suphead">
         <h1>Superadmin</h1>
         <button onClick={() => { sessionStorage.removeItem('super-pin'); onExit(); }}>Tutup</button>
       </div>
       <div className="supcards">
-        {cards.map(([label, v]) => (
-          <div key={label} className="supcard"><b>{v ?? '…'}</b><span>{label}</span></div>
+        {cards.map(([label, v], i) => (
+          <motion.div
+            key={label} className="supcard"
+            initial={{ opacity: 0, y: 12 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ duration: 0.25, delay: i * 0.05, ease: 'easeOut' }}
+          >
+            <b>{v ?? '…'}</b><span>{label}</span>
+          </motion.div>
         ))}
       </div>
 
+      <h2>Leaderboard Nilai (rahasia)</h2>
+      <div className="row">
+        <input type="date" value={lbFrom} onChange={(e) => e.target.value && setLbFrom(e.target.value)} />
+        <input type="date" value={lbTo} onChange={(e) => e.target.value && setLbTo(e.target.value)} />
+      </div>
+      <table className="suptable">
+        <thead><tr><th>#</th><th>Nama</th><th>Rata²</th><th>Dinilai</th></tr></thead>
+        <tbody>
+          {lb.map((r, i) => (
+            <tr key={r.memberId}>
+              <td>{i + 1}</td>
+              <td>{r.nama}</td>
+              <td><b>{r.rata2 ?? '—'}</b></td>
+              <td>{r.n}x</td>
+            </tr>
+          ))}
+          {lb.length === 0 && <tr><td colSpan={4} className="hint">Belum ada nilai terverifikasi.</td></tr>}
+        </tbody>
+      </table>
+
       <h2>Pengguna ({members.length})</h2>
       <table className="suptable">
-        <thead><tr><th></th><th>Nama</th><th>Jabatan</th><th>Wajah</th><th>Status</th></tr></thead>
+        <thead><tr><th></th><th>Nama</th><th>Jabatan</th><th>Wajah</th><th>Status</th><th></th></tr></thead>
         <tbody>
           {members.map((m) => (
             <tr key={m.id}>
@@ -106,6 +188,7 @@ export default function SuperView({ onExit }: { onExit: () => void }) {
               <td>{m.jabatan ?? '—'}</td>
               <td>{(faces.find((f) => f.memberId === m.id)?.descriptors.length ?? 0) || '—'}</td>
               <td>{isOnline(m) ? '🟢 online' : '⚫'}</td>
+              <td><button className="supdel" onClick={() => void hapus(m.id, m.nama)}>hapus</button></td>
             </tr>
           ))}
         </tbody>
@@ -144,14 +227,26 @@ export default function SuperView({ onExit }: { onExit: () => void }) {
       ))}
       {feed.length === 0 && <p className="hint">Kosong.</p>}
 
-      {preview && (
-        <div className="preview" onClick={() => setPreview(null)}>
-          <div className="pvcard" onClick={(e) => e.stopPropagation()}>
-            <img src={preview} alt="bukti" />
-            <button className="primary" onClick={() => setPreview(null)}>Tutup</button>
-          </div>
-        </div>
-      )}
-    </div>
+      <AnimatePresence>
+        {preview && (
+          <motion.div
+            className="preview" onClick={() => setPreview(null)}
+            initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
+            transition={{ duration: 0.2 }}
+          >
+            <motion.div
+              className="pvcard" onClick={(e) => e.stopPropagation()}
+              initial={{ opacity: 0, scale: 0.94, y: 14 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.96, y: 10 }}
+              transition={{ duration: 0.22, ease: 'easeOut' }}
+            >
+              <img src={preview} alt="bukti" />
+              <button className="primary" onClick={() => setPreview(null)}>Tutup</button>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+    </motion.div>
   );
 }

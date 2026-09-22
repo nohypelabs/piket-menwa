@@ -9,7 +9,7 @@ export interface TaskRow { id: number; tanggal: string; judul: string; done: num
 export interface SwapRow {
   id: string; requester: string; target: string;
   fromDay: DayKey; toDay: DayKey; alasan: string;
-  status: 'pending' | 'approved' | 'rejected'; createdAt: number;
+  status: 'pending' | 'approved' | 'rejected' | 'cancelled'; createdAt: number;
 }
 
 interface RosterRow { day: DayKey; memberId: string; jamMulai: string; jamSelesai: string }
@@ -40,6 +40,49 @@ async function post(url: string, body?: unknown): Promise<boolean> {
   }
 }
 
+// ---- web push (langganan notif tukar jadwal) ----
+const urlB64ToU8 = (b64: string) => {
+  const pad = '='.repeat((4 - (b64.length % 4)) % 4);
+  const bin = atob((b64 + pad).replace(/-/g, '+').replace(/_/g, '/'));
+  return Uint8Array.from(bin, (c) => c.charCodeAt(0));
+};
+
+export async function ensurePush(memberId: string): Promise<boolean> {
+  try {
+    if (!('Notification' in window) || !('serviceWorker' in navigator) || !('PushManager' in window)) return false;
+    if (Notification.permission !== 'granted') return false;
+    const reg = await navigator.serviceWorker.ready;
+    let sub = await reg.pushManager.getSubscription();
+    if (!sub) {
+      const { publicKey } = (await (await fetch('/api/push/public-key')).json()) as { publicKey: string };
+      sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: urlB64ToU8(publicKey) });
+    }
+    const r = await fetch('/api/push/subscribe', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ memberId, subscription: sub.toJSON() }),
+    });
+    return r.ok;
+  } catch {
+    return false;
+  }
+}
+
+export async function dropPush() {
+  try {
+    if (!('serviceWorker' in navigator) || !('PushManager' in window)) return;
+    const reg = await navigator.serviceWorker.ready;
+    const sub = await reg.pushManager.getSubscription();
+    if (sub) {
+      await fetch('/api/push/unsubscribe', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ endpoint: sub.endpoint }),
+      }).catch(() => {});
+      await sub.unsubscribe();
+    }
+  } catch { /* abaikan */ }
+}
 // ---- superadmin (dev) ----
 export const getSuperPin = () => sessionStorage.getItem('super-pin');
 
@@ -163,8 +206,12 @@ export async function createSwapRemote(s: Omit<SwapRow, 'id' | 'status' | 'creat
   return post('/api/swaps', s);
 }
 
-export async function decideSwapRemote(id: string, approve: boolean): Promise<boolean> {
-  return post(`/api/swaps/${id}/decide`, { approve });
+export async function decideSwapRemote(id: string, approve: boolean, by: string): Promise<boolean> {
+  return post(`/api/swaps/${id}/decide`, { approve, by });
+}
+
+export async function cancelSwapRemote(id: string, by: string): Promise<boolean> {
+  return post(`/api/swaps/${id}/cancel`, { by });
 }
 
 export async function saveRosterRemote(
@@ -251,15 +298,15 @@ export function ping(memberId: string) {
 export const isOnline = (m: { lastSeen: number | null }) =>
   !!m.lastSeen && Date.now() - m.lastSeen < 90000;
 
-// ---- pendaftaran mandiri (wajah + nama + angkatan + jabatan), tanpa login ----
+// ---- pendaftaran mandiri (wajah + nama + angkatan + jabatan + PIN), tanpa login ----
 export async function registerMember(
-  nama: string, angkatan: string, jabatan: string, descriptors: number[][], foto: string,
+  nama: string, angkatan: string, jabatan: string, pin: string, descriptors: number[][], foto: string,
 ): Promise<{ ok: boolean; memberId?: string; error?: string }> {
   try {
     const r = await fetch('/api/register', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ nama, angkatan, jabatan, descriptors, foto }),
+      body: JSON.stringify({ nama, angkatan, jabatan, pin, descriptors, foto }),
     });
     const j = (await r.json()) as { memberId?: string; error?: string };
     return r.ok ? { ok: true, memberId: j.memberId } : { ok: false, error: j.error ?? 'gagal' };
@@ -268,11 +315,40 @@ export async function registerMember(
   }
 }
 
+// ---- login PIN (alternatif wajah) ----
+export async function loginPin(pin: string): Promise<{ ok: boolean; memberId?: string; nama?: string; error?: string }> {
+  try {
+    const r = await fetch('/api/login/pin', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ pin }),
+    });
+    const j = (await r.json()) as { memberId?: string; nama?: string; error?: string };
+    return r.ok ? { ok: true, memberId: j.memberId, nama: j.nama } : { ok: false, error: j.error ?? 'gagal' };
+  } catch {
+    return { ok: false, error: 'offline — butuh online untuk masuk' };
+  }
+}
+
+export async function setLoginPin(memberId: string, pin: string): Promise<{ ok: boolean; error?: string }> {
+  try {
+    const r = await fetch('/api/pin/set', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ memberId, pin }),
+    });
+    const j = (await r.json()) as { error?: string };
+    return r.ok ? { ok: true } : { ok: false, error: j.error ?? 'gagal' };
+  } catch {
+    return { ok: false, error: 'offline' };
+  }
+}
+
 export async function deleteMember(id: string): Promise<boolean> {
   try {
     const r = await fetch(`/api/members/${id}`, {
       method: 'DELETE',
-      headers: { ...(getPin() ? { 'x-admin-pin': getPin() as string } : {}) },
+      headers: { ...(getSuperPin() ? { 'x-super-pin': getSuperPin() as string } : {}) },
     });
     return r.ok;
   } catch {

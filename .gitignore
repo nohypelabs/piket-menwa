@@ -16,6 +16,7 @@ dist-ssr
 *.db-wal
 *.db-shm
 uploads/
+server/.vapid.json
 
 # Editor directories and files
 .vscode/*

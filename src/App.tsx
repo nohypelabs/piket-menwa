@@ -1,14 +1,15 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
+import { AnimatePresence, motion } from 'framer-motion';
 import {
   ArrowLeftRight, Bell, CalendarDays, CalendarRange, Camera, Check, Clock, Info, Lock,
-  LockOpen, LogOut, PartyPopper, Plus, Repeat, RotateCw, ScanFace, Settings,
+  LockOpen, PartyPopper, Plus, Repeat, RotateCw, ScanFace, Settings,
   TriangleAlert, X,
 } from 'lucide-react';
 import {
-  clearPin, createSwapRemote, decideSwapRemote, deleteMember,
-  loadAttendance, loadChecks, loadEvidence, loadFaces, loadLapsit, loadState,
-  localChecks, markAttendance, ping, isOnline, registerMember, saveRosterRemote,
-  submitLapsit, uploadEvidence, verifyPin,
+  cancelSwapRemote, clearPin, createSwapRemote, decideSwapRemote,
+  dropPush, ensurePush, loadAttendance, loadChecks, loadEvidence, loadFaces,
+  loadLapsit, loadState, localChecks, loginPin, markAttendance, ping, isOnline,
+  registerMember, saveRosterRemote, setLoginPin, submitLapsit, uploadEvidence, verifyPin,
   type AppState, type AttRow, type EvidenceRow, type FaceRow, type LapsitRow,
   type Member, type SwapRow, type TaskRow,
 } from './api';
@@ -27,11 +28,28 @@ const todayLong = () => {
   return s.charAt(0).toUpperCase() + s.slice(1);
 };
 
+// Toast global (error/info/ok) dengan animasi framer-motion.
+function Toast({ t, onClose }: { t: { msg: string; kind: 'error' | 'ok' | 'info' }; onClose: () => void }) {
+  return (
+    <motion.div
+      className={`toast ${t.kind}`} onClick={onClose}
+      initial={{ opacity: 0, y: -14, x: '-50%' }}
+      animate={{ opacity: 1, y: 0, x: '-50%' }}
+      exit={{ opacity: 0, y: -14, x: '-50%' }}
+      transition={{ duration: 0.22, ease: 'easeOut' }}
+    >
+      {t.kind === 'ok' ? <Check size={16} /> : t.kind === 'info' ? <Info size={16} /> : <TriangleAlert size={16} />} {t.msg}
+    </motion.div>
+  );
+}
+
 // Modal kamera selfie: sekali-ambil (verifikasi/absen) atau burst (daftar).
-function FaceCam({ title, note, enroll, onShot, onEnroll, onClose, onRescan }: {
+function FaceCam({ title, note, enroll, enrolled, onShot, onEnroll, onClose, onRescan, onDuplicate, onPinLogin }: {
   title: string; note: string | null; enroll?: boolean;
+  enrolled: { memberId: string; descriptors: number[][] }[];
   onShot: (d: number[]) => void; onEnroll: (ds: number[][], photo: string | null) => void;
-  onClose: () => void; onRescan?: () => void;
+  onClose: () => void; onRescan?: () => void; onDuplicate?: (memberId: string) => void;
+  onPinLogin?: (pin: string) => Promise<{ ok: boolean; error?: string }>;
 }) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const liveRef = useRef(true);
@@ -42,9 +60,25 @@ function FaceCam({ title, note, enroll, onShot, onEnroll, onClose, onRescan }: {
   const [faceBox, setFaceBox] = useState<{ x: number; y: number; w: number; h: number } | null>(null);
   const [scanState, setScanState] = useState<'idle' | 'scanning' | 'done' | 'timeout'>('idle');
   const [scanHint, setScanHint] = useState<string | null>(null);
+  const [scanProg, setScanProg] = useState(8);
+  const [showPin, setShowPin] = useState(false);
+  const [pinIn, setPinIn] = useState('');
+  const [pinErr, setPinErr] = useState<string | null>(null);
+  const [pinBusy, setPinBusy] = useState(false);
+  const submitPin = async () => {
+    if (!onPinLogin) return;
+    setPinBusy(true);
+    setPinErr(null);
+    const r = await onPinLogin(pinIn);
+    setPinBusy(false);
+    if (!r.ok) setPinErr(r.error ?? 'Gagal masuk.');
+  };
   const stableRef = useRef(0);
   const onShotRef = useRef(onShot);
   onShotRef.current = onShot;
+  const vib = (p: number | number[]) => {
+    try { navigator.vibrate?.(p); } catch { /* abaikan */ }
+  };
   useEffect(() => {
     liveRef.current = true;
     let stream: MediaStream | null = null;
@@ -139,29 +173,35 @@ function FaceCam({ title, note, enroll, onShot, onEnroll, onClose, onRescan }: {
         if (!live) return;
         if (!s) {
           stableRef.current = 0;
+          setScanProg(8);
           setScanHint('Wajah tidak terdeteksi — kembali ke bingkai.');
           return;
         }
         if (s.faceRatio < 0.16) {
           stableRef.current = 0;
+          setScanProg(12);
           setScanHint('Mendekat sedikit ke kamera.');
           return;
         }
         if (Math.abs(s.yaw) > 0.10) {
           stableRef.current = 0;
+          setScanProg(20);
           setScanHint('Hadap depan, jangan miring.');
           return;
         }
         stableRef.current += 1;
         if (stableRef.current < 2) {
+          setScanProg(60);
           setScanHint('Tahan, jangan bergerak…');
           return;
         }
+        setScanProg(80);
         const d = await descriptorFromVideo(v);
         if (!live) return;
         if (d) {
           clearInterval(timer);
           setScanState('done');
+          setScanProg(100);
           setScanHint(null);
           onShotRef.current(d);
         }
@@ -173,6 +213,7 @@ function FaceCam({ title, note, enroll, onShot, onEnroll, onClose, onRescan }: {
     onRescan?.();
     stableRef.current = 0;
     setScanHint(null);
+    setScanProg(8);
     setScanState('scanning');
   };
   // Pendaftaran terpandu: 1 tahan (depan) → 2 geser kanan → 3 geser kiri.
@@ -180,20 +221,25 @@ function FaceCam({ title, note, enroll, onShot, onEnroll, onClose, onRescan }: {
   // → kebal mirror kamera & tetap dapat sepasang kiri-kanan.
   type Stage = 'idle' | 'center' | 'right' | 'left' | 'done';
   const [stage, setStage] = useState<Stage>('idle');
-  const gst = useRef({ stage: 'idle' as Stage, ok: 0, sideSign: 0, descs: [] as number[][], t0: 0 });
+  const [stageFrac, setStageFrac] = useState(0); // progres live dalam tahap
+  const gst = useRef({ stage: 'idle' as Stage, ok: 0, best: 0, sideSign: 0, descs: [] as number[][], t0: 0 });
   const onEnrollRef = useRef(onEnroll);
   onEnrollRef.current = onEnroll;
+  const onDuplicateRef = useRef(onDuplicate);
+  onDuplicateRef.current = onDuplicate;
   const startGuided = () => {
     if (!modelsReady) {
       setStatus('tunggu model siap dulu…');
       return;
     }
     warmAudio(); // buka kunci audio (butuh gesture) biar ting tahap bunyi
-    gst.current = { stage: 'center', ok: 0, sideSign: 0, descs: [], t0: Date.now() };
+    gst.current = { stage: 'center', ok: 0, best: 0, sideSign: 0, descs: [], t0: Date.now() };
+    setStageFrac(0);
     setStage('center');
   };
   const resetGuided = () => {
-    gst.current = { stage: 'idle', ok: 0, sideSign: 0, descs: [], t0: 0 };
+    gst.current = { stage: 'idle', ok: 0, best: 0, sideSign: 0, descs: [], t0: 0 };
+    setStageFrac(0);
     setStage('idle');
   };
   useEffect(() => {
@@ -220,58 +266,94 @@ function FaceCam({ title, note, enroll, onShot, onEnroll, onClose, onRescan }: {
         return;
       }
       const snap = async () => descriptorFromVideo(v).catch(() => null);
+      // Ambang melonggar bila user kesulitan >8 dtk di tahap yang sama.
+      const relaxed = Date.now() - R.t0 > 8000;
       if (R.stage === 'center') {
         setStatus('Tahap 1/3: TAHAN wajah menghadap depan, jangan bergerak…');
         if (Math.abs(s.yaw) < 0.06) {
           if (++R.ok >= 3) {
             const d = await snap();
             if (d) {
+              // Cek duplikat SEJAK tahap 1 — wajah dikenal langsung ditolak,
+              // tidak perlu menunggu 3 tahap selesai.
+              const dupe = identify(d, enrolled);
+              if (dupe) {
+                R.stage = 'idle';
+                setStage('idle');
+                setStageFrac(0);
+                onDuplicateRef.current?.(dupe.memberId);
+                return;
+              }
               R.descs.push(d);
               tingStage(0); // tahap 1 lolos
+              vib(15);
               R.stage = 'right';
               R.ok = 0;
+              R.best = 0;
               R.t0 = Date.now();
+              setStageFrac(0);
               setStage('right');
             } else {
               setStatus('Gagal merekam — tahan lagi.');
               R.ok = 0;
+              setStageFrac(0);
             }
+          } else {
+            setStageFrac(R.ok / 3);
           }
         } else {
           R.ok = 0;
+          setStageFrac(0);
           setStatus('Tahap 1/3: hadap DEPAN dulu (wajahmu miring).');
         }
       } else if (R.stage === 'right') {
+        const need = relaxed ? 0.085 : 0.11;
         setStatus('Tahap 2/3: GESER wajah perlahan ke KANAN…');
-        if (Math.abs(s.yaw) > 0.11) {
+        if (Math.abs(s.yaw) > need) {
+          R.best = Math.max(R.best, Math.abs(s.yaw));
+          setStageFrac(Math.min(0.95, R.best / (need * 1.6)));
           if (++R.ok >= 2) {
             const d = await snap();
             if (d) {
               R.descs.push(d);
               tingStage(1); // tahap 2 lolos
+              vib(15);
               R.sideSign = Math.sign(s.yaw);
               R.stage = 'left';
               R.ok = 0;
+              R.best = 0;
               R.t0 = Date.now();
+              setStageFrac(0);
               setStage('left');
             } else {
               setStatus('Gagal merekam — geser lagi.');
               R.ok = 0;
             }
           }
+        } else if (Math.abs(s.yaw) > need * 0.6) {
+          R.best = Math.max(R.best, Math.abs(s.yaw));
+          setStageFrac(Math.min(0.9, R.best / (need * 1.6)));
+          R.ok = 0;
+          setStatus('Tahap 2/3: dikit lagi ke kanan…');
         } else {
           R.ok = 0;
+          setStageFrac(0);
         }
       } else if (R.stage === 'left') {
+        const need = relaxed ? 0.07 : 0.09;
         setStatus('Tahap 3/3: GESER wajah perlahan ke KIRI…');
-        if (s.yaw * R.sideSign < -0.09) {
+        if (s.yaw * R.sideSign < -need) {
+          R.best = Math.max(R.best, Math.abs(s.yaw));
+          setStageFrac(Math.min(0.95, R.best / (need * 1.6)));
           if (++R.ok >= 2) {
             const d = await snap();
             if (d) {
               R.descs.push(d);
               tingStage(2); // tahap 3 lolos
+              vib([15, 60, 25]);
               R.stage = 'done';
               setStage('done');
+              setStageFrac(1);
               setStatus('Semua tahap terekam — menyimpan…');
               onEnrollRef.current(R.descs.slice(0, 3), photoFromVideo(v));
             } else {
@@ -279,8 +361,14 @@ function FaceCam({ title, note, enroll, onShot, onEnroll, onClose, onRescan }: {
               R.ok = 0;
             }
           }
+        } else if (s.yaw * R.sideSign < -need * 0.6) {
+          R.best = Math.max(R.best, Math.abs(s.yaw));
+          setStageFrac(Math.min(0.9, R.best / (need * 1.6)));
+          R.ok = 0;
+          setStatus('Tahap 3/3: dikit lagi ke kiri…');
         } else {
           R.ok = 0;
+          setStageFrac(0);
         }
       }
     }, 450);
@@ -294,13 +382,35 @@ function FaceCam({ title, note, enroll, onShot, onEnroll, onClose, onRescan }: {
       : (scanHint
         ?? (faceBox ? 'Wajah terlihat — hadap depan…' : 'Memindai wajah otomatis — hadap kamera')));
   const stageIdx = stage === 'center' ? 0 : stage === 'right' ? 1 : stage === 'left' ? 2 : stage === 'done' ? 3 : -1;
+  // Oval hidup: progres + hijau saat sukses. Enroll = tahap + fraksi live.
+  const ovalProg = enroll
+    ? (stageIdx < 0 ? 8 : Math.min(100, ((stageIdx + (stageIdx < 3 ? stageFrac : 0)) / 3) * 100))
+    : scanProg;
+  const ovalDone = enroll ? stage === 'done' : scanState === 'done';
   return (
     <div className="camwrap">
-      <div className="camcard">
+      <motion.div
+        className="camcard"
+        initial={{ opacity: 0, scale: 0.94, y: 14 }}
+        animate={{ opacity: 1, scale: 1, y: 0 }}
+        exit={{ opacity: 0, scale: 0.96, y: 10 }}
+        transition={{ duration: 0.22, ease: 'easeOut' }}
+      >
         <b>{title}</b>
         <div className="camview">
           <video ref={videoRef} playsInline muted autoPlay />
-          <div className="faceguide" />
+          <svg className="ovalsvg" viewBox="0 0 100 140" preserveAspectRatio="none">
+            <ellipse cx="50" cy="60" rx="30" ry="42" className="ovbg" />
+            <motion.ellipse
+              cx="50" cy="60" rx="30" ry="42"
+              className={ovalDone ? 'ovok' : 'ovrun'}
+              pathLength={100}
+              strokeDasharray="100"
+              initial={false}
+              animate={{ strokeDashoffset: 100 - ovalProg }}
+              transition={{ duration: 0.3, ease: 'easeOut' }}
+            />
+          </svg>
           {faceBox && (
             <div
               className="facedetect"
@@ -314,12 +424,21 @@ function FaceCam({ title, note, enroll, onShot, onEnroll, onClose, onRescan }: {
         <p className="hint">{hint}</p>
         {failed && <button className="primary" onClick={() => setTryNo((n) => n + 1)}><RotateCw size={15} /> Coba lagi</button>}
         {enroll && (
-          <div className="steps">
-            {['Tahan', 'Kanan', 'Kiri'].map((s, i) => (
-              <span key={s} className={stageIdx > i ? 'done' : stageIdx === i ? 'now' : ''}>
-                {stageIdx > i ? <Check size={12} /> : `${i + 1}.`} {s}
-              </span>
-            ))}
+          <>
+            <div className="stagebar"><i style={{ width: `${(Math.max(0, stageIdx) / 3) * 100}%` }} /></div>
+            <div className="steps">
+              {['Tahan', 'Kanan', 'Kiri'].map((s, i) => (
+                <span key={s} className={stageIdx > i ? 'done' : stageIdx === i ? 'now' : ''}>
+                  {stageIdx > i ? <Check size={12} /> : `${i + 1}.`} {s}
+                </span>
+              ))}
+            </div>
+          </>
+        )}
+        {enroll && stage === 'idle' && modelsReady && (
+          <div className="coach">
+            <span className="cbubble">Tap di sini untuk mulai</span>
+            <span className="carrow">▼</span>
           </div>
         )}
         <div className="row">
@@ -336,7 +455,31 @@ function FaceCam({ title, note, enroll, onShot, onEnroll, onClose, onRescan }: {
           )}
           <button onClick={onClose}>Tutup</button>
         </div>
-      </div>
+        {!enroll && onPinLogin && !showPin && (
+          <p className="whint dim">kendala wajah?{' '}
+            <button className="wlink dim" onClick={() => { setShowPin(true); setPinErr(null); }}>
+              masuk via PIN
+            </button>
+          </p>
+        )}
+        {!enroll && showPin && (
+          <div className="pinform">
+            <input
+              type="password" inputMode="numeric" maxLength={12}
+              placeholder="PIN 6 digit" value={pinIn}
+              onChange={(e) => setPinIn(e.target.value.replace(/\D/g, '').slice(0, 12))}
+              onKeyDown={(e) => { if (e.key === 'Enter') void submitPin(); }}
+            />
+            {pinErr && <em className="werr">{pinErr}</em>}
+            <div className="row">
+              <button className="primary" disabled={pinBusy} onClick={submitPin}>
+                {pinBusy ? '…' : 'Masuk'}
+              </button>
+              <button onClick={() => setShowPin(false)}>Batal</button>
+            </div>
+          </div>
+        )}
+      </motion.div>
     </div>
   );
 }
@@ -349,7 +492,9 @@ export default function App() {
   const [uploadingTugas, setUploadingTugas] = useState<string | null>(null);
   const [pendingTugas, setPendingTugas] = useState<string | null>(null);
   const photoRef = useRef<HTMLInputElement>(null);
-  const [preview, setPreview] = useState<{ file: string; judul: string; by: string } | null>(null);
+  const [preview, setPreview] = useState<{ file: string; judul: string; by: string; tanggal: string } | null>(null);
+  const [weekEv, setWeekEv] = useState<Record<string, EvidenceRow[]>>({});
+  const knownSwaps = useRef<Set<string> | null>(null);
   const [geo, setGeo] = useState<Geo | null>(null);
   const [lapsit, setLapsit] = useState<LapsitRow[]>([]);
   const [lapsitText, setLapsitText] = useState('');
@@ -373,7 +518,32 @@ export default function App() {
   const [regName, setRegName] = useState('');
   const [regAngkatan, setRegAngkatan] = useState('');
   const [regJabatan, setRegJabatan] = useState('');
+  const [regPin, setRegPin] = useState('');
   const [profiling, setProfiling] = useState(false);
+  const [showUnknown, setShowUnknown] = useState(false);
+  const [navHidden, setNavHidden] = useState(false);
+  const [showLogout, setShowLogout] = useState(false);
+  const [pinNew, setPinNew] = useState('');
+  const [pinMsg, setPinMsg] = useState<string | null>(null);
+
+  const pinLogin = async (pin: string) => {
+    const r = await loginPin(pin);
+    if (r.ok && r.memberId) {
+      setMe(r.memberId);
+      setToast({ msg: `Login berhasil — selamat datang, ${r.nama}`, kind: 'ok' });
+      void ensurePush(r.memberId);
+      try { sessionStorage.setItem('piket-unlock-date', dateStr(0)); } catch { /* abaikan */ }
+      setUnlocked(true);
+    }
+    return r;
+  };
+
+  const savePin = async () => {
+    if (!me) return;
+    const r = await setLoginPin(me, pinNew);
+    setPinMsg(r.ok ? 'PIN tersimpan ✓' : (r.error ?? 'Gagal simpan.'));
+    if (r.ok) setPinNew('');
+  };
   const [hash, setHash] = useState(() => location.hash);
   const [, setTitleTaps] = useState(0);
   const [admin, setAdmin] = useState(() => sessionStorage.getItem('piket-admin') === '1');
@@ -432,6 +602,24 @@ export default function App() {
       const a = await loadAttendance(dateStr(0), dateStr(0));
       setAtt(a ?? []);
       setLapsit((await loadLapsit(dateStr(0), dateStr(0))) ?? []);
+      // Notifikasi pengajuan tukar baru (untuk yang diminta / Admin).
+      const pend = s.swaps.filter((x) => x.status === 'pending');
+      if (knownSwaps.current) {
+        const fresh = pend.filter((x) => !knownSwaps.current!.has(x.id));
+        const nm = (id: string) => s.members.find((m) => m.id === id)?.nama ?? id;
+        const mine = fresh.filter((x) => x.target === me);
+        const forAdmin = admin ? fresh.filter((x) => x.target !== me) : [];
+        const show = [...mine, ...forAdmin];
+        if (show.length > 0) {
+          const w = show[0];
+          const msg = `Tukar baru: ${nm(w.requester)} → ${nm(w.target)} (${w.fromDay} ⇄ ${w.toDay})`;
+          setToast({ msg, kind: 'info' });
+          if ('Notification' in window && Notification.permission === 'granted') {
+            try { new Notification('Piket — tukar jadwal', { body: msg }); } catch { /* abaikan */ }
+          }
+        }
+      }
+      knownSwaps.current = new Set(s.swaps.map((x) => x.id));
     } else {
       setFaces([]);
       setAtt([]);
@@ -470,6 +658,23 @@ export default function App() {
   const jamHari = today === 'Libur' ? '' : (state?.jam[today] ?? '09.00–15.00');
   const doneCount = checks.filter((c) => c.done).length;
   const pending = (state?.swaps ?? []).filter((s) => s.status === 'pending');
+  const incoming = pending.filter((s) => s.target === me);
+  const outgoing = pending.filter((s) => s.requester === me);
+  const othersPending = pending.filter((s) => s.target !== me && s.requester !== me);
+  const approvedSwaps = useMemo(() => (state?.swaps ?? [])
+    .filter((s) => s.status === 'approved')
+    .sort((a, b) => b.createdAt - a.createdAt), [state]);
+  const swappedDays = useMemo(() => {
+    const weekAgo = Date.now() - 7 * 86400000;
+    const set = new Set<DayKey>();
+    for (const s of approvedSwaps) {
+      if (s.createdAt >= weekAgo) {
+        set.add(s.fromDay);
+        set.add(s.toDay);
+      }
+    }
+    return set;
+  }, [approvedSwaps]);
   const bellDot = tmr !== 'Libur' && (state?.schedule[tmr] ?? []).includes(me);
 
   // ---- Mingguan: tanggal Senin–Jumat minggu tampil + status selesai per tanggal ----
@@ -493,6 +698,13 @@ export default function App() {
       const out: Record<string, boolean> = {};
       const evRows = state?.fromApi ? await loadEvidence(weekDates[0], weekDates[4]) : null;
       const lapRows = state?.fromApi ? await loadLapsit(weekDates[0], weekDates[4]) : null;
+      if (live) {
+        const grouped: Record<string, EvidenceRow[]> = {};
+        for (const e of evRows ?? []) {
+          (grouped[e.tanggal] ??= []).push(e);
+        }
+        setWeekEv(grouped);
+      }
       await Promise.all(weekDates.map(async (ds) => {
         let rows: TaskRow[] | null = null;
         if (state?.fromApi) {
@@ -647,8 +859,10 @@ export default function App() {
   };
 
   const logout = () => {
+    void dropPush();
     setMe('');
     setUnlocked(false);
+    setShowLogout(false);
     try { sessionStorage.removeItem('piket-unlock-date'); } catch { /* abaikan */ }
   };
 
@@ -656,14 +870,22 @@ export default function App() {
     setRegName(p.nama);
     setRegAngkatan(p.angkatan);
     setRegJabatan(p.jabatan);
+    setRegPin(p.pin);
     setProfiling(false);
     warmAudio();
     setCamMsg('Tap Mulai, ikuti tahap: tahan – kanan – kiri');
     setCam({ mode: 'register' });
   };
 
+  // Duplikat ketahuan di tahap 1 → tolak cepat tanpa menunggu 3 tahap.
+  const handleDuplicate = (memberId: string) => {
+    const msg = `Wajah ini sudah terdaftar sebagai ${nama(memberId)} — pakai Masuk, jangan daftar lagi.`;
+    setCamMsg(msg);
+    setToast({ msg, kind: 'error' });
+  };
+
   const handleEnroll = async (ds: number[][], photo: string | null) => {
-    const parsed = profileSchema.safeParse({ nama: regName, angkatan: regAngkatan, jabatan: regJabatan });
+    const parsed = profileSchema.safeParse({ nama: regName, angkatan: regAngkatan, jabatan: regJabatan, pin: regPin });
     if (!parsed.success) {
       setCamMsg(parsed.error.issues[0]?.message ?? 'Profil invalid.');
       return;
@@ -683,17 +905,19 @@ export default function App() {
         return;
       }
     }
-    const res = await registerMember(parsed.data.nama, parsed.data.angkatan, parsed.data.jabatan, ds, photo);
+    const res = await registerMember(parsed.data.nama, parsed.data.angkatan, parsed.data.jabatan, parsed.data.pin, ds, photo);
     if (res.ok && res.memberId) {
       const hello = `${parsed.data.nama} (${parsed.data.jabatan}, angkatan ${parsed.data.angkatan})`;
       await refresh();
       setMe(res.memberId);
       setUnlocked(true); // wajah baru saja diverifikasi → langsung terbuka
       try { sessionStorage.setItem('piket-unlock-date', dateStr(0)); } catch { /* abaikan */ }
+      if (res.memberId) void ensurePush(res.memberId);
       void getGeo().then(setGeo);
       setRegName('');
       setRegAngkatan('');
       setRegJabatan('');
+      setRegPin('');
       setProfiling(false);
       setCam(null);
       setCamMsg(null);
@@ -711,11 +935,13 @@ export default function App() {
       if (!hit) {
         setCam(null);
         setCamMsg(null);
-        setProfiling(true); // wajah baru → isi nama + angkatan
+        setShowUnknown(true); // wajah baru → suruh daftar dulu
         return;
       }
       setMe(hit.memberId);
       ting(990, 0.18); // masuk
+      setToast({ msg: `Login berhasil — selamat datang, ${nama(hit.memberId)}`, kind: 'ok' });
+      void ensurePush(hit.memberId);
       setCam(null);
       setCamMsg(null);
       return;
@@ -737,6 +963,7 @@ export default function App() {
     try { sessionStorage.setItem('piket-unlock-date', dateStr(0)); } catch { /* abaikan */ }
     ting(990, 0.18); // absen lolos
     setToast({ msg: 'Absen berhasil — checklist & bukti terbuka', kind: 'ok' });
+    void ensurePush(me);
     void getGeo().then(setGeo); // siapkan koordinat untuk stempel foto
     setCam(null);
     setCamMsg(null);
@@ -761,8 +988,10 @@ export default function App() {
 
   const decide = async (w: SwapRow, approve: boolean) => {
     if (state?.fromApi) {
-      await decideSwapRemote(w.id, approve);
+      const ok = await decideSwapRemote(w.id, approve, me);
+      if (!ok) return alert('Gagal (hanya yang diminta / Admin).');
     } else {
+      if (me !== w.target && !admin) return alert('Hanya yang diminta / Admin.');
       const cur = load<SwapRow[]>('piket-swaps', []).map((x) =>
         x.id === w.id ? { ...x, status: approve ? ('approved' as const) : ('rejected' as const) } : x);
       save('piket-swaps', cur);
@@ -772,6 +1001,18 @@ export default function App() {
         sch[w.toDay] = sch[w.toDay].map((m) => (m === w.target ? w.requester : m));
         save('piket-schedule', sch);
       }
+    }
+    void refresh();
+  };
+
+  const cancelSwap = async (w: SwapRow) => {
+    if (!confirm('Batalkan pengajuan ini?')) return;
+    if (state?.fromApi) {
+      const ok = await cancelSwapRemote(w.id, me);
+      if (!ok) return alert('Gagal membatalkan.');
+    } else {
+      save('piket-swaps', load<SwapRow[]>('piket-swaps', []).map((x) =>
+        x.id === w.id ? { ...x, status: 'cancelled' as const } : x));
     }
     void refresh();
   };
@@ -809,13 +1050,6 @@ export default function App() {
     if (state.fromApi) await saveRosterRemote(state.schedule, next);
   };
 
-  const hapusMember = async (id: string) => {    if (!confirm(`Hapus ${nama(id)} + wajah & jadwalnya?`)) return;
-    const ok = await deleteMember(id);
-    if (!ok) return alert('Gagal hapus (butuh PIN Admin / online).');
-    if (me === id) logout();
-    void refresh();
-  };
-
   const gearClick = () => {
     if (admin) return setAdmin(false); // keluar mode Admin
     if (!state || !state.fromApi) return setAdmin(true); // offline: lokal saja
@@ -841,7 +1075,8 @@ export default function App() {
     if (!('Notification' in window)) return alert('Browser tidak dukung notifikasi.');
     const p = await Notification.requestPermission();
     if (p === 'granted') {
-      new Notification('Jadwal Piket Menwa USB YPKP', {
+      if (me) void ensurePush(me);
+      new Notification('Ki Menwa USB YPKP', {
         body: tmr === 'Libur' ? 'Besok libur, tidak ada piket.'
           : (state?.schedule[tmr] ?? []).includes(me)
             ? `H-1: besok (${tmr}) giliran kamu piket!` : `Besok (${tmr}) bukan giliranmu. Aman.`,
@@ -853,6 +1088,24 @@ export default function App() {
     const h = () => setHash(location.hash);
     window.addEventListener('hashchange', h);
     return () => window.removeEventListener('hashchange', h);
+  }, []);
+  useEffect(() => {
+    // Bottom nav: sembunyi saat scroll turun, muncul saat scroll naik / idle.
+    let lastY = window.scrollY;
+    let t: ReturnType<typeof setTimeout> | null = null;
+    const onScroll = () => {
+      const y = window.scrollY;
+      if (y > lastY + 4 && y > 80) setNavHidden(true);
+      else if (y < lastY - 4) setNavHidden(false);
+      lastY = y;
+      if (t) clearTimeout(t);
+      t = setTimeout(() => setNavHidden(false), 1500);
+    };
+    window.addEventListener('scroll', onScroll, { passive: true });
+    return () => {
+      window.removeEventListener('scroll', onScroll);
+      if (t) clearTimeout(t);
+    };
   }, []);
   // Pintu dev: tap judul 5× → dashboard superadmin.
   const titleTap = () => {
@@ -866,7 +1119,7 @@ export default function App() {
   };
   if (hash === '#super') {
     return (
-      <div className="phone wide">
+      <div className="phone wide tac">
         <SuperView onExit={() => { location.hash = ''; }} />
       </div>
     );
@@ -878,37 +1131,76 @@ export default function App() {
         : cam.mode === 'login'
           ? 'Masuk dengan wajah'
           : `Absen ${nama(me)}`}
-      note={camMsg}
-      enroll={cam.mode === 'register'}
+          note={camMsg}
+          enroll={cam.mode === 'register'}
+          enrolled={faces.map((f) => ({ memberId: f.memberId, descriptors: f.descriptors }))}
           onShot={(d) => void handleDescriptor(d)}
           onEnroll={(ds, photo) => void handleEnroll(ds, photo)}
           onClose={() => { setCam(null); setCamMsg(null); }}
           onRescan={() => setCamMsg(null)}
+          onDuplicate={handleDuplicate}
+          onPinLogin={async (pin) => {
+            const r = await pinLogin(pin);
+            if (r.ok) {
+              setCam(null);
+              setCamMsg(null);
+            }
+            return r;
+          }}
     />
   );
 
   // Gate: belum masuk → welcome / form profil. Daily page hanya utk yg login.
   if (!meMember) {
     return (
-      <div className="phone">
+      <div className="phone tac">
         {profiling
-          ? <ProfilePage onDone={onProfileDone} />
+          ? <ProfilePage onDone={onProfileDone} onCancel={() => setProfiling(false)} names={members.map((m) => m.nama)} existing={members.map((m) => ({ nama: m.nama, angkatan: m.angkatan }))} />
           : <WelcomePage onTap={loginCam} onRegister={() => setProfiling(true)} />}
-        {camModal}
-        {toast && (
-          <div className={`toast ${toast.kind}`} onClick={() => setToast(null)}>
-            {toast.kind === 'ok' ? <Check size={16} /> : toast.kind === 'info' ? <Info size={16} /> : <TriangleAlert size={16} />} {toast.msg}
-          </div>
-        )}
+        <AnimatePresence>
+          {showUnknown && (
+            <motion.div
+              className="preview" onClick={() => setShowUnknown(false)}
+              initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
+              transition={{ duration: 0.2 }}
+            >
+              <motion.div
+                className="pvcard" onClick={(e) => e.stopPropagation()}
+                initial={{ opacity: 0, scale: 0.94, y: 14 }}
+                animate={{ opacity: 1, scale: 1, y: 0 }}
+                exit={{ opacity: 0, scale: 0.96, y: 10 }}
+                transition={{ duration: 0.22, ease: 'easeOut' }}
+              >
+                <b>Wajah belum terdaftar</b>
+                <span className="hint">Sistem tidak mengenali wajahmu. Silakan daftar terlebih dahulu.</span>
+                <div className="row">
+                  <button className="primary" onClick={() => { setShowUnknown(false); setProfiling(true); }}>Registrasi</button>
+                  <button onClick={() => setShowUnknown(false)}>Tutup</button>
+                </div>
+              </motion.div>
+            </motion.div>
+          )}
+        </AnimatePresence>
+        <AnimatePresence>{camModal}</AnimatePresence>
+        <AnimatePresence>
+          {toast && <Toast t={toast} onClose={() => setToast(null)} />}
+        </AnimatePresence>
       </div>
     );
   }
 
   return (
-    <div className="phone">
+    <div className="phone tac">
       <header className="hd">
+        {meMember && (
+          <button className="hdavatar" onClick={() => setShowLogout(true)} title="profil">
+            {meMember.foto
+              ? <img src={meMember.foto} alt={meMember.nama} />
+              : <i className="pdot" style={{ background: meMember.warna }} />}
+          </button>
+        )}
         <div onClick={titleTap}>
-          <h1>Jadwal Piket Menwa USB YPKP</h1>
+          <h1>Ki Menwa USB YPKP</h1>
           <p>{todayLong()} • {members.length} anggota{state && !state.fromApi ? ' • offline' : ''}</p>
         </div>
         <div className="hbtns">
@@ -920,8 +1212,15 @@ export default function App() {
       </header>
       {!online && <div className="offline">● offline — data lokal</div>}
       {admin && <div className="adminbar">mode Admin aktif — kelola di tab Mingguan/Tukar</div>}
-      {showPin && (
-        <div className="pinsheet">
+      <AnimatePresence>
+        {showPin && (
+          <motion.div
+            className="pinsheet"
+            initial={{ opacity: 0, y: -10 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -10 }}
+            transition={{ duration: 0.2, ease: 'easeOut' }}
+          >
           <b>Masuk mode Admin</b>
           <span className="dim">Masukkan PIN Admin (1× per sesi)</span>
           <input
@@ -934,21 +1233,65 @@ export default function App() {
             <button className="primary" onClick={submitPin}>Masuk</button>
             <button onClick={() => setShowPin(false)}>Batal</button>
           </div>
-        </div>
-      )}
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      <AnimatePresence>
+        {showLogout && meMember && (
+          <motion.div
+            className="sheetwrap" onClick={() => setShowLogout(false)}
+            initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
+            transition={{ duration: 0.2 }}
+          >
+            <motion.div
+              className="sheet" onClick={(e) => e.stopPropagation()}
+              initial={{ y: '100%' }} animate={{ y: 0 }} exit={{ y: '100%' }}
+              transition={{ type: 'tween', duration: 0.28, ease: 'easeOut' }}
+              drag="y" dragConstraints={{ top: 0, bottom: 0 }} dragElastic={0.25}
+              onDragEnd={(_, info) => {
+                if (info.offset.y > 90 || info.velocity.y > 500) setShowLogout(false);
+              }}
+            >
+              <i className="grabber" />
+              {meMember.foto
+                ? <img className="sheetava" src={meMember.foto} alt={meMember.nama} />
+                : <i className="pdot big" style={{ background: meMember.warna }} />}
+              <b>{meMember.nama}</b>
+              <span className="hint">{[meMember.jabatan, meMember.angkatan].filter(Boolean).join(' · ')}</span>
+              <div className="pinrow">
+                <input
+                  type="password" inputMode="numeric" maxLength={12}
+                  placeholder="PIN baru (min 6 digit)" value={pinNew}
+                  onChange={(e) => { setPinNew(e.target.value.replace(/\D/g, '').slice(0, 12)); setPinMsg(null); }}
+                />
+                <button onClick={savePin}>Simpan PIN</button>
+                {pinMsg && <span className="pinmsg">{pinMsg}</span>}
+              </div>
+              <button className="danger" onClick={logout}>Logout</button>
+              <button className="ghostbtn" onClick={() => setShowLogout(false)}>Batal</button>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
 
       <div className="mebar">
         {meMember ? (
-          <>
-            <span>Masuk sebagai {meMember.foto ? <img className="ava" src={meMember.foto} alt={meMember.nama} /> : null}<b>{meMember.nama}</b>{meMember.jabatan ? ` · ${meMember.jabatan}` : ''}{meMember.angkatan ? ` ${meMember.angkatan}` : ''}</span>
-            <button className="ghost" onClick={logout}><LogOut size={13} /> Logout</button>
-          </>
+          <span>Masuk sebagai <b>{meMember.nama}</b>{meMember.jabatan ? ` · ${meMember.jabatan}` : ''}{meMember.angkatan ? ` ${meMember.angkatan}` : ''}</span>
         ) : (
           <span className="hint">Belum masuk.</span>
         )}
       </div>
 
       <main>
+        <AnimatePresence mode="wait">
+          <motion.div
+            key={tab}
+            initial={{ opacity: 0, x: 24 }}
+            animate={{ opacity: 1, x: 0 }}
+            exit={{ opacity: 0, x: -24 }}
+            transition={{ duration: 0.18, ease: 'easeOut' }}
+          >
         {tab === 'hari' && (
           <>
             <p className="tgl">{todayLong()}</p>
@@ -1008,7 +1351,7 @@ export default function App() {
                           onClick={(e) => {
                             e.stopPropagation();
                             if (!unlocked) return needVerify();
-                            if (ph) setPreview({ file: ph.file, judul: c.judul, by: nama(ph.memberId) });
+                            if (ph) setPreview({ file: ph.file, judul: c.judul, by: nama(ph.memberId), tanggal: dateStr(0) });
                             else pickPhoto(c.judul);
                           }}
                         >
@@ -1039,7 +1382,15 @@ export default function App() {
                         <em>{done}/{g.items.length}</em>
                       </button>
                       {open && (
-                        <ul className="tasks">
+                        <AnimatePresence initial={false}>
+                          <motion.ul
+                            className="tasks"
+                            initial={{ height: 0, opacity: 0 }}
+                            animate={{ height: 'auto', opacity: 1 }}
+                            exit={{ height: 0, opacity: 0 }}
+                            transition={{ duration: 0.22, ease: 'easeOut' }}
+                            style={{ overflow: 'hidden' }}
+                          >
                           {g.items.map((it, ii) => {
                             const k = `${gi}:${ii}`;
                             const on = bdDone.includes(k);
@@ -1050,7 +1401,8 @@ export default function App() {
                               </li>
                             );
                           })}
-                        </ul>
+                          </motion.ul>
+                        </AnimatePresence>
                       )}
                     </div>
                   );
@@ -1149,7 +1501,18 @@ export default function App() {
                         )}
                       </span>
                     )}
+                    {(weekEv[ds] ?? []).length > 0 && (
+                      <span className="dayph">
+                        {(weekEv[ds] ?? []).map((e) => (
+                          <img
+                            key={e.id} src={e.file} alt={e.tugas}
+                            onClick={() => setPreview({ file: e.file, judul: e.tugas, by: nama(e.memberId), tanggal: ds })}
+                          />
+                        ))}
+                      </span>
+                    )}
                   </div>
+                  {swappedDays.has(d) && <em className="swapmark" title="hari ini hasil tukar jadwal"><ArrowLeftRight size={12} /></em>}
                   {isToday
                     ? <em className="pill sm">hari ini</em>
                     : weekStat[ds]
@@ -1158,6 +1521,16 @@ export default function App() {
                 </div>
               );
             })}
+            {approvedSwaps.length > 0 && (
+              <div className="swaplog">
+                <b>Hasil tukar jadwal</b>
+                {approvedSwaps.slice(0, 5).map((s) => (
+                  <p key={s.id} className="hist">
+                    {nama(s.requester)} <ArrowLeftRight size={11} /> {nama(s.target)} • {s.fromDay} <ArrowLeftRight size={11} /> {s.toDay}
+                  </p>
+                ))}
+              </div>
+            )}
             {admin && <button className="rotbtn" onClick={putarRotasi}><Repeat size={14} /> Putar rotasi minggu depan (Admin)</button>}
             {admin && (
               <>
@@ -1176,7 +1549,6 @@ export default function App() {
                           <span>{m.nama}{m.jabatan ? ` · ${m.jabatan}` : ''}{m.angkatan ? ` ${m.angkatan}` : ''}</span>
                           {isOnline(m) && <i className="onlinedot" title="online" />}
                           <em className={n ? 'badge-ok' : 'badge-no'}>{n ? <>wajah <Check size={11} /></> : 'tanpa wajah'}</em>
-                          <button onClick={() => void hapusMember(m.id)}>hapus</button>
                         </div>
                       );
                     })}
@@ -1220,25 +1592,45 @@ export default function App() {
               value={alasan} onChange={(e) => setAlasan(e.target.value)}
             />
             <button className="bigbtn" onClick={submitSwap}>Kirim permintaan tukar</button>
-            <h2 className="sec">Menunggu persetujuan{pending.length ? ` (${pending.length})` : ''}</h2>
-            {pending.length === 0 && <p className="hint">Tidak ada pengajuan menunggu.</p>}
-            {pending.map((w) => (
-              <div key={w.id}>
-                <div className="waitcard">
-                  <i className="pdot" style={{ background: warna(w.requester) }} />
-                  <span>{nama(w.requester)} meminta tukar<br />{dayDate(w.fromDay)} <ArrowLeftRight size={12} /> {dayDate(w.toDay)}</span>
-                  {admin
-                    ? <button className="ketua" onClick={() => setExpanded(expanded === w.id ? null : w.id)}>aksi Admin</button>
-                    : <em className="ketua static">aksi Admin</em>}
-                </div>
-                {admin && expanded === w.id && (
-                  <div className="row waitrow">
-                    <button className="primary" onClick={() => { setExpanded(null); decide(w, true); }}>Approve</button>
-                    <button onClick={() => { setExpanded(null); decide(w, false); }}>Tolak</button>
-                  </div>
-                )}
+            {incoming.map((w) => (
+              <div key={w.id} className="waitcard">
+                <i className="pdot" style={{ background: warna(w.requester) }} />
+                <span>{nama(w.requester)} meminta tukar<br />{dayDate(w.fromDay)} <ArrowLeftRight size={12} /> {dayDate(w.toDay)}</span>
               </div>
             ))}
+            {incoming.length > 0 && (
+              <div className="row waitrow">
+                <button className="primary" onClick={() => decide(incoming[0], true)}>Terima</button>
+                <button onClick={() => decide(incoming[0], false)}>Tolak</button>
+              </div>
+            )}
+            {outgoing.map((w) => (
+              <div key={w.id} className="waitcard">
+                <i className="pdot" style={{ background: warna(w.target) }} />
+                <span>Ke {nama(w.target)}<br />{dayDate(w.fromDay)} <ArrowLeftRight size={12} /> {dayDate(w.toDay)} • menunggu</span>
+                <button className="ketua" onClick={() => cancelSwap(w)}>batalkan</button>
+              </div>
+            ))}
+            {admin && othersPending.length > 0 && (
+              <>
+                <h2 className="sec">Antrean lain (Admin override)</h2>
+                {othersPending.map((w) => (
+                  <div key={w.id}>
+                    <div className="waitcard">
+                      <i className="pdot" style={{ background: warna(w.requester) }} />
+                      <span>{nama(w.requester)} → {nama(w.target)}<br />{dayDate(w.fromDay)} <ArrowLeftRight size={12} /> {dayDate(w.toDay)}</span>
+                      <button className="ketua" onClick={() => setExpanded(expanded === w.id ? null : w.id)}>aksi Admin</button>
+                    </div>
+                    {expanded === w.id && (
+                      <div className="row waitrow">
+                        <button className="primary" onClick={() => { setExpanded(null); decide(w, true); }}>Approve</button>
+                        <button onClick={() => { setExpanded(null); decide(w, false); }}>Tolak</button>
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </>
+            )}
             {(state?.swaps ?? []).some((s) => s.status !== 'pending') && (
               <>
                 <h2 className="sec">Riwayat</h2>
@@ -1249,34 +1641,51 @@ export default function App() {
             )}
           </>
         )}
+          </motion.div>
+        </AnimatePresence>
       </main>
 
       {tab === 'hari' && checks.length > 0 && (
         <div className="progress"><i style={{ width: `${(doneCount / checks.length) * 100}%` }} /></div>
       )}
-      {camModal}
-      {toast && (
-        <div className={`toast ${toast.kind}`} onClick={() => setToast(null)}>
-          {toast.kind === 'ok' ? <Check size={16} /> : toast.kind === 'info' ? <Info size={16} /> : <TriangleAlert size={16} />} {toast.msg}
-        </div>
-      )}
-      {preview && (
-        <div className="preview" onClick={() => setPreview(null)}>
-          <div className="pvcard" onClick={(e) => e.stopPropagation()}>
-            <img src={preview.file} alt={preview.judul} />
-            <b>{preview.judul}</b>
-            <span className="hint">oleh {preview.by} • {dateStr(0).split('-').reverse().join('/')} • final, tidak bisa diubah</span>
-            <div className="row">
-              <button className="primary" onClick={() => setPreview(null)}>Tutup</button>
-            </div>
-          </div>
-        </div>
-      )}
-      <nav className="tabs">
+      <AnimatePresence>{camModal}</AnimatePresence>
+      <AnimatePresence>
+        {toast && <Toast t={toast} onClose={() => setToast(null)} />}
+      </AnimatePresence>
+      <AnimatePresence>
+        {preview && (
+          <motion.div
+            className="preview" onClick={() => setPreview(null)}
+            initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
+            transition={{ duration: 0.2 }}
+          >
+            <motion.div
+              className="pvcard" onClick={(e) => e.stopPropagation()}
+              initial={{ opacity: 0, scale: 0.94, y: 14 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.96, y: 10 }}
+              transition={{ duration: 0.22, ease: 'easeOut' }}
+            >
+              <img src={preview.file} alt={preview.judul} />
+              <b>{preview.judul}</b>
+              <span className="hint">oleh {preview.by} • {preview.tanggal.split('-').reverse().join('/')} • final, tidak bisa diubah</span>
+              <div className="row">
+                <button className="primary" onClick={() => setPreview(null)}>Tutup</button>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+      <motion.nav
+        className="tabs"
+        initial={false}
+        animate={{ x: '-50%', y: navHidden ? '110%' : '0%' }}
+        transition={{ type: 'tween', duration: 0.3, ease: 'easeOut' }}
+      >
         <button className={tab === 'hari' ? 'on' : ''} onClick={() => setTab('hari')}><CalendarDays size={20} /><span>Hari Ini</span></button>
         <button className={tab === 'minggu' ? 'on' : ''} onClick={() => setTab('minggu')}><CalendarRange size={20} /><span>Mingguan</span></button>
         <button className={tab === 'tukar' ? 'on' : ''} onClick={() => setTab('tukar')}><ArrowLeftRight size={20} /><span>Tukar{pending.length ? ` (${pending.length})` : ''}</span></button>
-      </nav>
+      </motion.nav>
     </div>
   );
 }

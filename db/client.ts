@@ -24,7 +24,7 @@ sqlite.exec(`
 CREATE TABLE IF NOT EXISTS members (
   id TEXT PRIMARY KEY, nama TEXT NOT NULL, warna TEXT NOT NULL,
   divisi TEXT NOT NULL DEFAULT 'acara', foto TEXT, angkatan TEXT, jabatan TEXT,
-  last_seen INTEGER
+  last_seen INTEGER, pin_hash TEXT
 );
 CREATE TABLE IF NOT EXISTS roster (
   id INTEGER PRIMARY KEY AUTOINCREMENT, day TEXT NOT NULL,
@@ -66,6 +66,46 @@ CREATE TABLE IF NOT EXISTS lapsit (
   created_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_lapsit_tanggal ON lapsit(tanggal);
+CREATE TABLE IF NOT EXISTS push_subs (
+  endpoint TEXT PRIMARY KEY,
+  member_id TEXT NOT NULL REFERENCES members(id),
+  sub TEXT NOT NULL, created_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS tugas_master (
+  no INTEGER PRIMARY KEY, kategori TEXT NOT NULL, judul TEXT NOT NULL UNIQUE,
+  bobot INTEGER NOT NULL, jenis TEXT NOT NULL, foto_wajib INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS assessments (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, tanggal TEXT NOT NULL,
+  member_id TEXT NOT NULL REFERENCES members(id),
+  status TEXT NOT NULL DEFAULT 'draft', nilai REAL,
+  submitted_at INTEGER, verified_by TEXT, verified_at INTEGER
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_assess_uniq ON assessments(tanggal, member_id);
+CREATE TABLE IF NOT EXISTS assessment_items (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  assessment_id INTEGER NOT NULL REFERENCES assessments(id),
+  no INTEGER NOT NULL, kategori TEXT NOT NULL, judul TEXT NOT NULL,
+  bobot INTEGER NOT NULL, jenis TEXT NOT NULL,
+  foto_wajib INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'tidak', done_by TEXT,
+  CONSTRAINT chk_item_na CHECK (jenis='Kondisional' OR status != 'na')
+);
+CREATE TABLE IF NOT EXISTS item_koreksi (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  item_id INTEGER NOT NULL REFERENCES assessment_items(id),
+  status_lama TEXT NOT NULL, status_baru TEXT NOT NULL,
+  catatan TEXT NOT NULL, by TEXT NOT NULL, at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS kehadiran (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, tanggal TEXT NOT NULL,
+  member_id TEXT NOT NULL REFERENCES members(id),
+  status TEXT NOT NULL DEFAULT 'hadir', acc TEXT, by TEXT, at INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_hadir_uniq ON kehadiran(tanggal, member_id);
+CREATE TABLE IF NOT EXISTS settings (
+  key TEXT PRIMARY KEY, value TEXT NOT NULL
+);
 `);
 
 // Migrasi DB lama (evidence per-anggota selfie/tugas) → per-tugas. Dev-only.
@@ -98,6 +138,11 @@ try {
   if (!mcols.some((c) => c.name === 'last_seen')) {
     sqlite.exec('ALTER TABLE members ADD COLUMN last_seen INTEGER');
     console.log('migrasi members +last_seen ok');
+  }
+  if (!mcols.some((c) => c.name === 'pin_hash')) {
+    sqlite.exec('ALTER TABLE members ADD COLUMN pin_hash TEXT');
+    sqlite.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_pin_unique ON members(pin_hash)');
+    console.log('migrasi members +pin_hash ok');
   }
 } catch { /* DB fresh, lewati */ }
 

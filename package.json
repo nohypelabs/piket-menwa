@@ -22,9 +22,11 @@
     "cors": "^2.8.6",
     "drizzle-orm": "^0.45.3",
     "express": "^5.2.1",
+    "framer-motion": "^13.4.0",
     "lucide-react": "^1.47.0",
     "react": "^19.2.8",
     "react-dom": "^19.2.8",
+    "web-push": "^3.6.7",
     "zod": "^4.6.5"
   },
   "devDependencies": {
