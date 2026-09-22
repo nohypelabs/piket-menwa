@@ -324,7 +324,7 @@ app.post('/api/register', (req, res) => {
     nama: string; angkatan: string; jabatan: string; pin: string; descriptors: unknown; foto: string;
   };
   const clean = (nama ?? '').trim().replace(/\s+/g, ' ').slice(0, 30);
-  if (clean.length < 2) return void res.status(400).json({ error: 'nama minimal 2 huruf' });
+  if (clean.length < 5) return void res.status(400).json({ error: 'nama minimal 5 huruf' });
   const year = (angkatan ?? '').trim();
   const yNum = Number(year);
   if (!/^\d{4}$/.test(year) || yNum < 2000 || yNum > new Date().getFullYear() + 1) {

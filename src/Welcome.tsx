@@ -21,7 +21,7 @@ export const profileSchema = z.object({
   nama: z
     .string()
     .trim()
-    .min(2, 'Nama minimal 2 huruf')
+    .min(5, 'Nama minimal 5 huruf')
     .max(30, 'Nama maksimal 30 huruf')
     .regex(/^[A-Za-zÀ-ÿ'’.\- ]+$/, 'Nama hanya huruf, spasi, titik, strip'),
   angkatan: z
@@ -345,13 +345,18 @@ export function ProfilePage({ onDone, onCancel, names, existing }: {
       animate={{ opacity: 1 }}
       transition={{ duration: 0.25 }}
     >
-      <div className="psteps">
-        {STEP_LABELS.map((s, i) => (
-          <span key={s} className={i === step ? 'on' : i < step ? 'done' : ''}>
-            {i + 1}. {s}
-          </span>
+      <div className="pbar">
+        {[0, 1, 2, 3].map((i) => (
+          <motion.i
+            key={i}
+            initial={false}
+            animate={{ opacity: i <= step ? 1 : 0.25 }}
+            transition={{ duration: 0.25 }}
+            className={i <= step ? 'on' : ''}
+          />
         ))}
       </div>
+      <p className="pstep-label">Langkah {step + 1} dari 4 — {STEP_LABELS[step]}</p>
       <AnimatePresence mode="wait" custom={dir}>
         <motion.div
           key={step}

@@ -102,6 +102,11 @@ body { margin:0; background:#070a09; color:var(--ink); font-family: system-ui,-a
 .tac .wbtn { background:#4ade80; color:#04120a; border-radius:3px; text-transform:uppercase; letter-spacing:2px; font-family:inherit; }
 .tac .wbtn.ghost { background:transparent; color:#4ade80; border:1px solid rgba(74,222,128,.5); }
 .tac .werr { color:#f87171; }
+/* register: semua radius 0 */
+.welcome.tac .wfield input, .welcome.tac .wfield select,
+.welcome.tac .jabcard, .welcome.tac .wheel,
+.welcome.tac .wbtn, .welcome.tac .dupebox, .welcome.tac .wlogo,
+.welcome.tac .psteps span { border-radius:0; }
 .wfield { display:flex; flex-direction:column; gap:6px; width:100%; text-align:left; font-size:13px; color:var(--dim); margin-top:6px; }
 .wfield input { background:var(--card); border:1px solid var(--line); color:var(--ink); border-radius:12px; padding:13px; font-size:16px; width:100%; }
 .wfield select { background:var(--card); border:1px solid var(--line); color:var(--ink); border-radius:12px; padding:13px; font-size:16px; width:100%; }
@@ -124,10 +129,11 @@ body { margin:0; background:#070a09; color:var(--ink); font-family: system-ui,-a
 .dupebox span { font-size:12px; color:var(--dim); }
 .dupebox .wbtn { margin-top:6px; }
 /* ---- Wizard register ---- */
-.psteps { display:flex; gap:6px; width:100%; }
-.psteps span { flex:1; text-align:center; font-size:11px; color:var(--dim); border:1px solid var(--line); border-radius:99px; padding:6px 4px; }
-.psteps span.on { color:var(--ink); border-color:var(--accent); font-weight:700; }
-.psteps span.done { color:#4ade80; border-color:rgba(74,222,128,.4); }
+.pbar { display:flex; gap:6px; width:100%; }
+.pbar i { flex:1; height:5px; border-radius:99px; background:var(--line); display:block; }
+.pbar i.on { background:var(--accent); box-shadow:0 0 8px rgba(232,240,236,.25); }
+.pstep-label { font-size:12px; color:var(--dim); margin:0; }
+.tac .pbar i.on { background:#4ade80; box-shadow:0 0 8px rgba(74,222,128,.5); }
 .pslide { width:100%; }
 .welcome .row { display:flex; gap:8px; width:100%; }
 .welcome .row .wbtn { margin-top:0; flex:1; }
