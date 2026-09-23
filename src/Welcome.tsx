@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { AnimatePresence, motion } from 'framer-motion';
-import { Award, Briefcase, ClipboardList, FileText, Fingerprint, Flag, Medal, PenLine, Shield, Sprout, Users } from 'lucide-react';
+import { Award, Briefcase, ClipboardList, FileText, Fingerprint, Flag, Lock as LockIcon, Medal, PenLine, ScanFace, Shield, Sprout, Users } from 'lucide-react';
 import { z } from 'zod';
 
 export const JABATAN_LIST = [
@@ -40,25 +40,30 @@ export const profileSchema = z.object({
     .trim()
     .min(2, 'Jabatan minimal 2 huruf')
     .max(40, 'Jabatan maksimal 40 huruf'),
-  pin: z
-    .string()
-    .regex(/^\d{6,}$/, 'PIN minimal 6 digit angka')
-    .refine((p) => !/^(\d)\1+$/.test(p), { message: 'PIN tidak boleh angka sama semua' })
-    .refine(
-      (p) => {
-        const asc = '01234567890123456789';
-        const desc = '98765432109876543210';
-        for (let i = 0; i + 6 <= p.length; i++) {
-          const s = p.slice(i, i + 6);
-          if (asc.includes(s) || desc.includes(s)) return false;
-        }
-        return true;
-      },
-      { message: 'PIN tidak boleh berurutan' },
-    ),
-}).refine((v) => !v.pin.includes(v.angkatan), {
-  message: 'PIN tidak boleh mengandung tahun angkatan',
-  path: ['pin'],
+  consentWajah: z.boolean(),
+  pin: z.string(),
+}).superRefine((v, ctx) => {
+  const minLen = v.consentWajah ? 6 : 8;
+  if (!new RegExp(`^\\d{${minLen},}$`).test(v.pin)) {
+    ctx.addIssue({ code: 'custom', path: ['pin'], message: `PIN minimal ${minLen} digit angka` });
+    return;
+  }
+  if (/^(\d)\1+$/.test(v.pin)) {
+    ctx.addIssue({ code: 'custom', path: ['pin'], message: 'PIN tidak boleh angka sama semua' });
+    return;
+  }
+  const asc = '01234567890123456789';
+  const desc = '98765432109876543210';
+  for (let i = 0; i + 6 <= v.pin.length; i++) {
+    const s = v.pin.slice(i, i + 6);
+    if (asc.includes(s) || desc.includes(s)) {
+      ctx.addIssue({ code: 'custom', path: ['pin'], message: 'PIN tidak boleh berurutan' });
+      return;
+    }
+  }
+  if (v.pin.includes(v.angkatan)) {
+    ctx.addIssue({ code: 'custom', path: ['pin'], message: 'PIN tidak boleh mengandung tahun angkatan' });
+  }
 });
 
 export type Profile = z.infer<typeof profileSchema>;
@@ -112,36 +117,88 @@ export function YearWheel({ value, onChange }: { value: string; onChange: (y: st
   );
 }
 
-export function WelcomePage({ onTap, onRegister }: { onTap: () => void; onRegister: () => void }) {
+export function WelcomePage({ onTap, onRegister, onPinLogin }: {
+  onTap: () => void; onRegister: () => void;
+  onPinLogin: (pin: string) => Promise<{ ok: boolean; error?: string }>;
+}) {
   // Slot logo: taruh file di public/brand/logo-menwa.png → otomatis kepakai.
   // Belum ada file = fallback ikon Shield.
   const [logoOk, setLogoOk] = useState(true);
-  // Fingerprint FAKE: tahan 1 detik → popup scanning → face login.
+  // Fingerprint FAKE 2 tahap (KEBALIK dari biasa): tahan 1 dtk → PIN,
+  // tahan terus sampai 2 dtk → face recognition.
   const [holding, setHolding] = useState(false);
+  const [holdStage, setHoldStage] = useState<0 | 1 | 2>(0);
   const [scanning, setScanning] = useState(false);
-  const timer = useRef<number | null>(null);
+  const [showPinSheet, setShowPinSheet] = useState(false);
+  const [pinIn, setPinIn] = useState('');
+  const [pinErr, setPinErr] = useState<string | null>(null);
+  const [pinBusy, setPinBusy] = useState(false);
+  const timers = useRef<number[]>([]);
+  const faceFired = useRef(false);
+  const t0 = useRef(0);
   const R = 44;
   const CIRC = 2 * Math.PI * R;
   useEffect(() => () => {
-    if (timer.current) window.clearTimeout(timer.current);
+    timers.current.forEach((t) => window.clearTimeout(t));
   }, []);
+  const clearTimers = () => {
+    timers.current.forEach((t) => window.clearTimeout(t));
+    timers.current = [];
+  };
+  const vib = (p: number | number[]) => {
+    try { navigator.vibrate?.(p); } catch { /* abaikan */ }
+  };
+  const submitPin = async () => {
+    setPinBusy(true);
+    setPinErr(null);
+    const r = await onPinLogin(pinIn);
+    setPinBusy(false);
+    if (r.ok) {
+      setShowPinSheet(false);
+      setPinIn('');
+    } else {
+      setPinErr(r.error ?? 'Gagal masuk.');
+    }
+  };
   const start = () => {
     setHolding(true);
-    timer.current = window.setTimeout(() => {
-      timer.current = null;
+    setHoldStage(0);
+    faceFired.current = false;
+    t0.current = Date.now();
+    timers.current.push(window.setTimeout(() => {
+      // Tahap 1 (1 dtk): buka sheet PIN.
+      setHoldStage(1);
+      vib(15);
+      setPinErr(null);
+      setShowPinSheet(true);
+    }, 1000));
+    timers.current.push(window.setTimeout(() => {
+      // Tahap 2 (2 dtk): tutup PIN, alih ke face recognition.
+      faceFired.current = true;
       setHolding(false);
-      try { navigator.vibrate?.(20); } catch { /* abaikan */ }
+      setHoldStage(0);
+      vib([20, 40, 30]);
+      setShowPinSheet(false);
       setScanning(true);
       window.setTimeout(() => {
         setScanning(false);
         onTap();
       }, 900);
-    }, 1000);
+    }, 2000));
   };
   const cancel = () => {
-    if (timer.current) window.clearTimeout(timer.current);
-    timer.current = null;
+    clearTimers();
+    const held = Date.now() - t0.current;
+    const fired = faceFired.current;
+    faceFired.current = false;
     setHolding(false);
+    setHoldStage(0);
+    // Sheet PIN sudah dibuka di tahap 1 → biarkan terbuka.
+    // Face sudah jalan → biarkan. Tap singkat → batal total.
+    if (fired || held < 1000) {
+      if (!fired) setShowPinSheet(false);
+      return;
+    }
   };
   return (
     <motion.div
@@ -201,15 +258,52 @@ export function WelcomePage({ onTap, onRegister }: { onTap: () => void; onRegist
               strokeDasharray={CIRC}
               initial={{ strokeDashoffset: CIRC }}
               animate={{ strokeDashoffset: holding ? 0 : CIRC }}
-              transition={{ duration: holding ? 1 : 0.25, ease: 'linear' }}
+              transition={{ duration: holding ? 2 : 0.25, ease: 'linear' }}
             />
           </svg>
           <motion.span animate={{ scale: holding ? 1.08 : 1 }} transition={{ duration: 0.2 }}>
             <Fingerprint size={44} />
           </motion.span>
         </button>
-        <p className="whint">tahan 1 detik untuk masuk</p>
+        <p className="whint">
+          {holding && holdStage >= 1 ? 'lepas = PIN • tahan terus = wajah' : 'tahan 1 dtk PIN • 2 dtk wajah'}
+        </p>
       </motion.div>
+      <AnimatePresence>
+        {showPinSheet && (
+          <motion.div
+            className="preview" onClick={() => setShowPinSheet(false)}
+            initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
+            transition={{ duration: 0.2 }}
+          >
+            <motion.div
+              className="sheet pinsheet-modal" onClick={(e) => e.stopPropagation()}
+              initial={{ y: '100%' }} animate={{ y: 0 }} exit={{ y: '100%' }}
+              transition={{ type: 'tween', duration: 0.28, ease: 'easeOut' }}
+              drag="y" dragConstraints={{ top: 0, bottom: 0 }} dragElastic={0.25}
+              onDragEnd={(_, info) => {
+                if (info.offset.y > 90 || info.velocity.y > 500) setShowPinSheet(false);
+              }}
+            >
+              <i className="grabber" />
+              <b>Masuk via PIN</b>
+              <input
+                type="password" inputMode="numeric" maxLength={12}
+                placeholder="PIN 6 digit" value={pinIn}
+                onChange={(e) => setPinIn(e.target.value.replace(/\D/g, '').slice(0, 12))}
+                onKeyDown={(e) => { if (e.key === 'Enter') void submitPin(); }}
+              />
+              {pinErr && <em className="werr">{pinErr}</em>}
+              <div className="row">
+                <button className="primary" disabled={pinBusy} onClick={submitPin}>
+                  {pinBusy ? '…' : 'Masuk'}
+                </button>
+                <button onClick={() => setShowPinSheet(false)}>Batal</button>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
       <AnimatePresence>
         {scanning && (
           <motion.div
@@ -245,7 +339,7 @@ export function WelcomePage({ onTap, onRegister }: { onTap: () => void; onRegist
         animate={{ opacity: 1 }}
         transition={{ duration: 0.35, delay: 0.4 }}
       >
-        Wajah Anda tidak tersimpan dan langsung terenkripsi AES-256-GCM oleh sistem.
+        Foto wajah Anda tidak tersimpan. Hanya embedding yang disimpan dan terenkripsi oleh AES-256-GCM.
       </motion.p>
     </motion.div>
   );
@@ -255,9 +349,8 @@ const stepSchemas = [
   z.object({ nama: profileSchema.shape.nama }),
   z.object({ angkatan: profileSchema.shape.angkatan }),
   z.object({ jabatan: profileSchema.shape.jabatan }),
-  z.object({ pin: profileSchema.shape.pin }),
 ];
-const STEP_LABELS = ['Nama', 'Angkatan', 'Jabatan', 'PIN'];
+const STEP_LABELS = ['Nama', 'Angkatan', 'Jabatan', 'Persetujuan Data Wajah', 'PIN'];
 
 export function ProfilePage({ onDone, onCancel, names, existing }: {
   onDone: (p: Profile) => void; onCancel: () => void; names: string[];
@@ -269,6 +362,7 @@ export function ProfilePage({ onDone, onCancel, names, existing }: {
   const [angkatan, setAngkatan] = useState(() => String(new Date().getFullYear()));
   const [jabPreset, setJabPreset] = useState('');
   const [jabCustom, setJabCustom] = useState('');
+  const [consentWajah, setConsentWajah] = useState<boolean | null>(null);
   const [pin, setPin] = useState('');
   const [err, setErr] = useState<string | null>(null);
   // Placeholder animasi dari nama pendaftar beneran (bukan hardcode).
@@ -309,7 +403,7 @@ export function ProfilePage({ onDone, onCancel, names, existing }: {
   }, [nama, namesKey]);
 
   const jab = jabPreset === '__custom' ? jabCustom : jabPreset;
-  const vals = [{ nama }, { angkatan }, { jabatan: jab }, { pin }];
+  const vals = [{ nama }, { angkatan }, { jabatan: jab }];
 
   // Nama + angkatan yang sama = kemungkinan akun sudah ada.
   const norm = (s: string) => s.trim().toLowerCase();
@@ -319,18 +413,22 @@ export function ProfilePage({ onDone, onCancel, names, existing }: {
 
   const go = (d: number) => {
     const ns = step + d;
-    if (ns < 0 || ns > 3) return;
+    if (ns < 0 || ns > 4) return;
     if (d > 0) {
       if (step === 2 && !jab) {
         setErr('Pilih jabatan atau isi manual.');
         return;
       }
-      const payload = step === 3 ? { nama, angkatan, jabatan: jab, pin } : vals[step];
-      const schema = step === 3 ? profileSchema : stepSchemas[step];
-      const r = schema.safeParse(payload);
-      if (!r.success) {
-        setErr(r.error.issues[0]?.message ?? 'Isian belum valid.');
+      if (step === 3 && consentWajah === null) {
+        setErr('Pilih salah satu opsi persetujuan.');
         return;
+      }
+      if (step < 3) {
+        const r = stepSchemas[step].safeParse(vals[step]);
+        if (!r.success) {
+          setErr(r.error.issues[0]?.message ?? 'Isian belum valid.');
+          return;
+        }
       }
     }
     setErr(null);
@@ -343,7 +441,11 @@ export function ProfilePage({ onDone, onCancel, names, existing }: {
       setErr('Pilih jabatan atau isi manual.');
       return;
     }
-    const r = profileSchema.safeParse({ nama, angkatan, jabatan: jab, pin });
+    if (consentWajah === null) {
+      setErr('Pilih salah satu opsi persetujuan.');
+      return;
+    }
+    const r = profileSchema.safeParse({ nama, angkatan, jabatan: jab, consentWajah, pin });
     if (!r.success) {
       setErr(r.error.issues[0]?.message ?? 'Isian belum valid.');
       return;
@@ -360,7 +462,7 @@ export function ProfilePage({ onDone, onCancel, names, existing }: {
       transition={{ duration: 0.25 }}
     >
       <div className="pbar">
-        {[0, 1, 2, 3].map((i) => (
+        {[0, 1, 2, 3, 4].map((i) => (
           <motion.i
             key={i}
             initial={false}
@@ -370,7 +472,7 @@ export function ProfilePage({ onDone, onCancel, names, existing }: {
           />
         ))}
       </div>
-      <p className="pstep-label">Langkah {step + 1} dari 4 — {STEP_LABELS[step]}</p>
+      <p className="pstep-label">Langkah {step + 1} dari 5 — {STEP_LABELS[step]}</p>
       <AnimatePresence mode="wait" custom={dir}>
         <motion.div
           key={step}
@@ -432,16 +534,52 @@ export function ProfilePage({ onDone, onCancel, names, existing }: {
             </div>
           )}
           {step === 3 && (
+            <div className="wfield consent">
+              <span>Persetujuan Pemrosesan Data Wajah</span>
+              <p className="hint">
+                Sesuai UU No. 27/2022 (Pelindungan Data Pribadi), wajah adalah data pribadi
+                spesifik. Kami butuh persetujuan Anda: foto wajah TIDAK disimpan — hanya
+                embedding (representasi angka) yang diproses lalu dienkripsi AES-256-GCM,
+                dipakai untuk verifikasi absensi piket. Anda bisa menolak dan pakai PIN saja.
+              </p>
+              <div className="consentgrid">
+                <button
+                  type="button"
+                  className={`jabcard ${consentWajah === true ? 'sel' : ''}`}
+                  onClick={() => setConsentWajah(true)}
+                >
+                  <ScanFace size={16} /> Setuju, pakai wajah untuk absen
+                </button>
+                <button
+                  type="button"
+                  className={`jabcard ${consentWajah === false ? 'sel' : ''}`}
+                  onClick={() => setConsentWajah(false)}
+                >
+                  <LockIcon size={16} /> Tidak, pakai PIN saja
+                </button>
+              </div>
+              {consentWajah === false && (
+                <p className="hint warn">
+                  Absen piket harianmu nanti diinput manual oleh admin (bukan otomatis kamera),
+                  karena PIN adalah satu-satunya faktor keamanan akunmu.
+                </p>
+              )}
+            </div>
+          )}
+          {step === 4 && (
             <label className="wfield">
-              <span>PIN login (min 6 digit)</span>
+              <span>PIN login (min {consentWajah ? 6 : 8} digit)</span>
               <input
                 type="password" inputMode="numeric" maxLength={12}
-                placeholder="misal: 482917"
+                placeholder={consentWajah ? 'misal: 482917' : 'misal: 48291736'}
                 value={pin}
                 onChange={(e) => setPin(e.target.value.replace(/\D/g, '').slice(0, 12))}
                 onKeyDown={(e) => { if (e.key === 'Enter') submit(); }}
               />
-              <small className="hint">Jangan angka sama semua, berurutan, atau tahun angkatanmu.</small>
+              <small className="hint">
+                Jangan angka sama semua, berurutan, atau tahun angkatanmu.
+                {!consentWajah && ' PIN 8 digit karena ini satu-satunya kunci akunmu.'}
+              </small>
             </label>
           )}
         </motion.div>
@@ -468,9 +606,11 @@ export function ProfilePage({ onDone, onCancel, names, existing }: {
         {step > 0
           ? <button className="wbtn ghost" onClick={() => go(-1)}>Sebelumnya</button>
           : <button className="wbtn ghost" onClick={onCancel}>TUTUP</button>}
-        {step < 3
+        {step < 4
           ? <button className="wbtn" disabled={dupe} onClick={() => go(1)}>Lanjut</button>
-          : <button className="wbtn" disabled={dupe} onClick={submit}>Lanjut scan wajah</button>}
+          : <button className="wbtn" disabled={dupe} onClick={submit}>
+              {consentWajah ? 'Lanjut scan wajah' : 'Daftar'}
+            </button>}
       </div>
     </motion.div>
   );

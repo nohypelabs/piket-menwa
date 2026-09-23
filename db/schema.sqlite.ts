@@ -13,6 +13,7 @@ export const members = sqliteTable('members', {
   jabatan: text('jabatan'), // jabatan di kompi
   lastSeen: integer('last_seen'), // heartbeat presence (epoch ms)
   pinHash: text('pin_hash'), // SHA-256 PIN login (unik)
+  noFaceConsent: integer('no_face_consent').notNull().default(0), // 1 = menolak scan wajah saat daftar (PIN-only, absen diinput manual admin)
 });
 
 export const roster = sqliteTable('roster', {
@@ -112,6 +113,15 @@ export const pushSubs = sqliteTable('push_subs', {
   sub: text('sub').notNull(), // JSON subscription
   createdAt: integer('created_at').notNull(),
 });
+// Bukti match wajah hari ini: dasar token atestasi (1 hari, multi-pakai).
+export const attestIssued = sqliteTable('attest_issued', {
+  memberId: text('member_id')
+    .notNull()
+    .references(() => members.id),
+  tanggal: text('tanggal').notNull(),
+  at: integer('at').notNull(),
+});
+
 // Wajah terdaftar: 1 baris per anggota, descriptors = CIPHERTEXT (AES-256-GCM,
 // lihat db/crypto.ts) dari JSON number[][] (maks 3 vektor 128-dim). Tidak ada
 // foto wajah di sini — cuma embedding terenkripsi, matching dilakukan di
@@ -133,6 +143,11 @@ export const attendance = sqliteTable('attendance', {
     .references(() => members.id),
   jam: text('jam').notNull(), // HH.MM
   createdAt: integer('created_at').notNull(),
+  // Selfie absen (HANYA untuk member noFaceConsent=1, pengganti face-match).
+  // Ciphertext AES-256-GCM (foto sudah di-watermark nama+jam+logo di client
+  // SEBELUM dienkripsi) — dipakai sebagai bukti rekap, BUKAN utk matching
+  // algoritma apa pun. Hanya admin/superadmin yang bisa minta didekripsi.
+  selfieEnc: text('selfie_enc'),
 });
 
 // ---- Penilaian piket per orang (hybrid: checklist per shift diganti per orang) ----

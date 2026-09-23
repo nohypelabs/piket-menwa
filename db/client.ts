@@ -52,8 +52,12 @@ CREATE TABLE IF NOT EXISTS evidence (
   file TEXT NOT NULL, created_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_evidence_tanggal ON evidence(tanggal);
-CREATE TABLE IF NOT EXISTS faces (
-  member_id TEXT PRIMARY KEY REFERENCES members(id),
+CREATE TABLE IF NOT EXISTS attest_issued (
+  member_id TEXT NOT NULL REFERENCES members(id),
+  tanggal TEXT NOT NULL, at INTEGER NOT NULL,
+  PRIMARY KEY (member_id, tanggal)
+);
+CREATE TABLE IF NOT EXISTS faces (  member_id TEXT PRIMARY KEY REFERENCES members(id),
   descriptors TEXT NOT NULL, updated_at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS attendance (
@@ -152,6 +156,15 @@ try {
     sqlite.exec('ALTER TABLE members ADD COLUMN pin_hash TEXT');
     sqlite.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_pin_unique ON members(pin_hash)');
     console.log('migrasi members +pin_hash ok');
+  }
+  if (!mcols.some((c) => c.name === 'no_face_consent')) {
+    sqlite.exec("ALTER TABLE members ADD COLUMN no_face_consent INTEGER NOT NULL DEFAULT 0");
+    console.log('migrasi members +no_face_consent ok');
+  }
+  const acols = sqlite.prepare('PRAGMA table_info(attendance)').all() as { name: string }[];
+  if (!acols.some((c) => c.name === 'selfie_enc')) {
+    sqlite.exec('ALTER TABLE attendance ADD COLUMN selfie_enc TEXT');
+    console.log('migrasi attendance +selfie_enc ok');
   }
   const rcols = sqlite.prepare('PRAGMA table_info(roster)').all() as { name: string }[];
   if (!rcols.some((c) => c.name === 'week_start')) {

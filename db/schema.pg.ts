@@ -15,6 +15,7 @@ export const members = pgTable('members', {
   jabatan: text('jabatan'),
   lastSeen: integer('last_seen'),
   pinHash: text('pin_hash'),
+  noFaceConsent: integer('no_face_consent').notNull().default(0),
 });
 
 export const roster = pgTable('roster', {
@@ -98,6 +99,14 @@ export const pushSubs = pgTable('push_subs', {
   createdAt: integer('created_at').notNull(),
 });
 
+export const attestIssued = pgTable('attest_issued', {
+  memberId: text('member_id')
+    .notNull()
+    .references(() => members.id),
+  tanggal: text('tanggal').notNull(),
+  at: integer('at').notNull(),
+});
+
 export const faces = pgTable('faces', {
   memberId: text('member_id')
     .primaryKey()
@@ -114,6 +123,7 @@ export const attendance = pgTable('attendance', {
     .references(() => members.id),
   jam: text('jam').notNull(),
   createdAt: integer('created_at').notNull(),
+  selfieEnc: text('selfie_enc'),
 });
 
 export const tugasMaster = pgTable('tugas_master', {

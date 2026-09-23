@@ -13,10 +13,12 @@ function loadKey(): Buffer {
   if (b64) {
     const buf = Buffer.from(b64, 'base64');
     if (buf.length === 32) return buf;
-    console.warn('⚠️  FACE_ENC_KEY invalid (harus base64 32 byte) — pakai key acak sementara (restart = data lama tidak terbaca!)');
-  } else {
-    console.warn('⚠️  FACE_ENC_KEY belum diset di .env — pakai key acak SEMENTARA (data embedding hilang saat restart). Generate: node -e "console.log(require(\'crypto\').randomBytes(32).toString(\'base64\'))"');
   }
+  if (process.env.NODE_ENV === 'production') {
+    console.error('FATAL: FACE_ENC_KEY wajib base64 32 byte di production — server tidak dijalankan.');
+    process.exit(1);
+  }
+  console.warn('⚠️  FACE_ENC_KEY belum valid — pakai key acak SEMENTARA (data embedding hilang saat restart). Jangan deploy begini!');
   return randomBytes(32); // fallback dev-only, tidak persisten antar-restart
 }
 

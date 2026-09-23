@@ -2,21 +2,41 @@ import cors from 'cors';
 import { and, eq, isNull } from 'drizzle-orm';
 import express from 'express';
 import fs from 'node:fs';
-import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
+import { createHash, createHmac, randomBytes, scryptSync, timingSafeEqual } from 'node:crypto';
 import path from 'node:path';
 import webpush from 'web-push';
 import { db } from '../db/client.ts';
 import { attendance, evidence, faces, lapsit, members, pushSubs, roster, swaps, tasks, breakdown } from '../db/schema.sqlite.ts';
 import {
-  assessments, assessmentItems, itemKoreksi, kehadiran, settings, tugasMaster,
+  assessments, assessmentItems, attestIssued, itemKoreksi, kehadiran, settings, tugasMaster,
 } from '../db/schema.sqlite.ts';
 import { NILAI_MASTER, hitungNilai } from '../db/nilai_master.ts';
 import { encryptJson, decryptJson } from '../db/crypto.ts';
 import { identify as identifyFace, type Enrolled } from '../db/face_match.ts';
 
 const app = express();
-app.use(cors());
+// CORS dibatasi via env saat produksi; dev tetap terbuka.
+app.use(cors(process.env.CORS_ORIGIN ? { origin: process.env.CORS_ORIGIN.split(',') } : undefined));
 app.use(express.json({ limit: '12mb' })); // foto dikirim sebagai dataURL terkompresi
+
+// Rate-limit sederhana in-memory (per IP + path sensitif).
+const buckets = new Map<string, { n: number; reset: number }>();
+const rateLimit = (max: number, windowMs: number) => (
+  req: import('express').Request,
+  res: import('express').Response,
+  next: import('express').NextFunction,
+) => {
+  const key = `${req.ip ?? 'x'}:${req.path}`;
+  const now = Date.now();
+  const b = buckets.get(key);
+  if (!b || now > b.reset) {
+    buckets.set(key, { n: 1, reset: now + windowMs });
+    return next();
+  }
+  b.n += 1;
+  if (b.n > max) return void res.status(429).json({ error: 'terlalu sering, coba lagi nanti' });
+  next();
+};
 
 // File: ./uploads (nanti: Supabase Storage). Struktur sekarang:
 //   uploads/profil/*  → avatar profil OPSIONAL (bukan data biometrik), tetap
@@ -28,10 +48,21 @@ const UPLOAD_DIR = process.env.UPLOAD_DIR ?? './uploads';
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 app.use('/uploads/profil', express.static(path.resolve(UPLOAD_DIR, 'profil')));
 
+// ---- secret policy: production WAJIB env, dev boleh default (berisik, tanpa nilai) ----
+const IS_PROD = process.env.NODE_ENV === 'production';
+const needEnv = (name: string, devFallback: string): string => {
+  const v = process.env[name];
+  if (v) return v;
+  if (IS_PROD) {
+    console.error(`FATAL: ${name} wajib diset di production — server tidak dijalankan.`);
+    process.exit(1);
+  }
+  console.warn(`⚠️  ${name} belum diset — pakai default DEV. Jangan deploy begini!`);
+  return devFallback;
+};
+
 // ---- signed URL utk foto bukti piket: HMAC(path, exp) pakai FACE_ENC_KEY ----
-// (key sama dgn enkripsi embedding — cukup 1 secret utk keperluan dev ini;
-// saat pindah Supabase, ganti pola ini dengan signed URL Supabase Storage asli.)
-const SIGN_KEY = process.env.FACE_ENC_KEY ?? 'dev-only-insecure-key-ganti-di-.env';
+const SIGN_KEY = needEnv('FACE_ENC_KEY', 'dev-only-insecure-key-ganti-di-.env');
 function signPath(relPath: string, expMs: number): string {
   const h = createHmac('sha256', SIGN_KEY).update(`${relPath}:${expMs}`).digest('hex');
   return h;
@@ -56,18 +87,19 @@ app.get('/uploads-signed/evidence/:file', (req, res) => {
 const DAYS = ['Senin', 'Selasa', 'Rabu', 'Kamis', 'Jumat'] as const;
 
 // ---- role: user vs admin(ketua). Aksi admin wajib header x-admin-pin ----
-const ADMIN_PIN = process.env.ADMIN_PIN ?? '1234';
-if (!process.env.ADMIN_PIN) console.log('⚠️  ADMIN_PIN belum diset, pakai default "1234" — ganti via env.');
+const ADMIN_PIN = needEnv('ADMIN_PIN', '1234');
 
 // ---- superadmin (dev): dashboard monitoring, PIN terpisah ----
-const SUPER_PIN = process.env.SUPER_PIN ?? '041294';
-if (!process.env.SUPER_PIN) console.log('⚠️  SUPER_PIN belum diset, pakai default "041294" — ganti via env.');
+const SUPER_PIN = needEnv('SUPER_PIN', '041294');
 const requireSuper = (
   req: import('express').Request,
   res: import('express').Response,
   next: import('express').NextFunction,
 ) => {
-  if (req.header('x-super-pin') !== SUPER_PIN) {
+  const got = req.header('x-super-pin') ?? '';
+  const a = Buffer.from(got);
+  const b = Buffer.from(SUPER_PIN);
+  if (a.length !== b.length || !timingSafeEqual(a, b)) {
     return void res.status(403).json({ error: 'butuh PIN superadmin' });
   }
   next();
@@ -79,7 +111,7 @@ const todayLocal = () => {
 };
 
 app.post('/api/super/verify', (req, res) => {
-  res.json({ ok: req.body?.pin === SUPER_PIN });
+  res.json({ ok: pinEq(req.body?.pin, SUPER_PIN) });
 });
 
 app.get('/api/super/overview', requireSuper, (_req, res) => {
@@ -122,20 +154,61 @@ app.get('/api/super/feed', requireSuper, (req, res) => {
   res: import('express').Response,
   next: import('express').NextFunction,
 ) => {
-  if (req.header('x-admin-pin') !== ADMIN_PIN) {
+  const got = req.header('x-admin-pin') ?? '';
+  const a = Buffer.from(got);
+  const b = Buffer.from(ADMIN_PIN);
+  if (a.length !== b.length || !timingSafeEqual(a, b)) {
     return void res.status(403).json({ error: 'butuh PIN Admin' });
   }
   next();
 };
 
+// Perbandingan PIN constant-time (anti timing-oracle).
+const pinEq = (got: unknown, expected: string): boolean => {
+  if (typeof got !== 'string' || !got) return false;
+  const a = Buffer.from(got);
+  const b = Buffer.from(expected);
+  return a.length === b.length && timingSafeEqual(a, b);
+};
+
+// ---- atestasi wajah: bukti lolos face-match hari ini ----
+// Token = HMAC(memberId:tanggal), diterbitkan saat match lolos, berlaku
+// hari itu untuk aksi member tsb (absen/evidence/lapsit). Tanpa ini server
+// tidak percaya klaim memberId apa pun dari HP.
+const attestToken = (memberId: string, tanggal: string): string =>
+  createHmac('sha256', SIGN_KEY).update(`${memberId}:${tanggal}`).digest('hex');
+
+const checkAttest = (token: unknown, memberId: string, tanggal: string): boolean => {
+  if (typeof token !== 'string' || !token || !memberId || !tanggal) return false;
+  const good = attestToken(memberId, tanggal);
+  if (token.length !== good.length) return false;
+  if (!timingSafeEqual(Buffer.from(token), Buffer.from(good))) return false;
+  return db.select().from(attestIssued)
+    .where(and(eq(attestIssued.memberId, memberId), eq(attestIssued.tanggal, tanggal))).all()
+    .length > 0;
+};
+
+const issueAttest = (memberId: string, tanggal: string): string => {
+  const ex = db.select().from(attestIssued)
+    .where(and(eq(attestIssued.memberId, memberId), eq(attestIssued.tanggal, tanggal))).all()[0];
+  if (!ex) db.insert(attestIssued).values({ memberId, tanggal, at: Date.now() }).run();
+  return attestToken(memberId, tanggal);
+};
+
 app.post('/api/admin/verify', (req, res) => {
-  res.json({ ok: req.body?.pin === ADMIN_PIN });
+  res.json({ ok: pinEq(req.body?.pin, ADMIN_PIN) });
 });
 
 // ---- bootstrap: semua state dalam 1 call ----
 app.get('/api/state', (_req, res) => {
+  // pinHash TIDAK boleh bocor ke client (walau sudah di-hash, tetap rahasia).
+  const publicMembers = db.select({
+    id: members.id, nama: members.nama, warna: members.warna, divisi: members.divisi,
+    foto: members.foto, angkatan: members.angkatan, jabatan: members.jabatan,
+    lastSeen: members.lastSeen, noFaceConsent: members.noFaceConsent,
+  }).from(members).all();
   res.json({
-    members: db.select().from(members).all(),
+    members: publicMembers,
     roster: db.select().from(roster).all(),
     template: db.select().from(tasks).where(eq(tasks.tanggal, 'template')).all(),
     swaps: db.select().from(swaps).all().sort((a, b) => b.createdAt - a.createdAt),
@@ -270,7 +343,7 @@ app.post('/api/swaps/:id/decide', (req, res) => {
   const row = db.select().from(swaps).where(eq(swaps.id, req.params.id)).all()[0];
   if (!row) return void res.status(404).json({ error: 'swap tidak ditemukan' });
   if (row.status !== 'pending') return void res.status(400).json({ error: 'sudah diputuskan' });
-  const isAdmin = req.header('x-admin-pin') === ADMIN_PIN;
+  const isAdmin = pinEq(req.header('x-admin-pin'), ADMIN_PIN);
   if (!isAdmin && by !== row.target) {
     return void res.status(403).json({ error: 'hanya yang diminta / Admin' });
   }
@@ -298,7 +371,7 @@ app.post('/api/swaps/:id/cancel', (req, res) => {
   const row = db.select().from(swaps).where(eq(swaps.id, req.params.id)).all()[0];
   if (!row) return void res.status(404).json({ error: 'swap tidak ditemukan' });
   if (row.status !== 'pending') return void res.status(400).json({ error: 'sudah diputuskan' });
-  const isAdmin = req.header('x-admin-pin') === ADMIN_PIN;
+  const isAdmin = pinEq(req.header('x-admin-pin'), ADMIN_PIN);
   if (!isAdmin && by !== row.requester) {
     return void res.status(403).json({ error: 'hanya pemohon / Admin' });
   }
@@ -390,11 +463,40 @@ const saveDataUrl = (dataUrl: string, dest: string): string | null => {
   return dest;
 };
 
-const shaPin = (pin: string) => createHash('sha256').update(pin).digest('hex');
+const hashPin = (pin: string): string => {
+  const salt = randomBytes(16).toString('hex');
+  return `${salt}$${scryptSync(pin, salt, 32).toString('hex')}`;
+};
+const verifyPinHash = (pin: string, stored: string): boolean => {
+  const [salt, h] = stored.split('$');
+  if (!salt || !h) return false;
+  const a = Buffer.from(scryptSync(pin, salt, 32).toString('hex'));
+  const b = Buffer.from(h);
+  return a.length === b.length && timingSafeEqual(a, b);
+};
+// Cari member by PIN (hash unik per user, jadi iterasi + verifikasi satu-satu).
+// Format lama (sha256 tanpa garam, pra-migrasi): cocok → upgrade diam-diam ke scrypt.
+const sha256legacy = (pin: string) => createHash('sha256').update(pin).digest('hex');
+const findByPin = (pin: string) => {
+  for (const m of db.select().from(members).all()) {
+    if (!m.pinHash) continue;
+    if (verifyPinHash(pin, m.pinHash)) return m;
+    if (!m.pinHash.includes('$') && m.pinHash === sha256legacy(pin)) {
+      const upgraded = hashPin(pin);
+      db.update(members).set({ pinHash: upgraded }).where(eq(members.id, m.id)).run();
+      return { ...m, pinHash: upgraded };
+    }
+  }
+  return undefined;
+};
+const pinTaken = (pin: string, exceptId?: string): boolean => {
+  const m = findByPin(pin);
+  return !!m && m.id !== exceptId;
+};
 
-// Aturan PIN: ≥6 digit, bukan angka sama semua, bukan urutan, bukan tahun angkatan.
-const pinError = (pin: string, angkatan: string): string | null => {
-  if (!/^\d{6,}$/.test(pin ?? '')) return 'PIN minimal 6 digit angka';
+// Aturan PIN: minLen digit (default 6; 8 kalau tanpa wajah), bukan angka sama semua, bukan urutan, bukan tahun angkatan.
+const pinError = (pin: string, angkatan: string, minLen = 6): string | null => {
+  if (!new RegExp(`^\\d{${minLen},}$`).test(pin ?? '')) return `PIN minimal ${minLen} digit angka`;
   if (/^(\d)\1+$/.test(pin)) return 'PIN tidak boleh angka sama semua';
   const asc = '01234567890123456789';
   const desc = '98765432109876543210';
@@ -407,8 +509,8 @@ const pinError = (pin: string, angkatan: string): string | null => {
 };
 
 app.post('/api/register', (req, res) => {
-  const { nama, angkatan, jabatan, pin, descriptors } = (req.body ?? {}) as {
-    nama: string; angkatan: string; jabatan: string; pin: string; descriptors: unknown;
+  const { nama, angkatan, jabatan, pin, descriptors, noFaceConsent } = (req.body ?? {}) as {
+    nama: string; angkatan: string; jabatan: string; pin: string; descriptors: unknown; noFaceConsent?: boolean;
   };
   const clean = (nama ?? '').trim().replace(/\s+/g, ' ').slice(0, 30);
   if (clean.length < 5) return void res.status(400).json({ error: 'nama minimal 5 huruf' });
@@ -419,12 +521,15 @@ app.post('/api/register', (req, res) => {
   }
   const jab = (jabatan ?? '').trim().replace(/\s+/g, ' ').slice(0, 40);
   if (jab.length < 2) return void res.status(400).json({ error: 'jabatan minimal 2 huruf' });
-  const pinErr = pinError(pin, year);
+  const noFace = noFaceConsent === true;
+  // Tanpa consent wajah: PIN wajib LEBIH PANJANG (8 digit) karena jadi
+  // satu-satunya faktor otentikasi akun (tidak ada verifikasi wajah cadangan).
+  const pinErr = pinError(pin, year, noFace ? 8 : 6);
   if (pinErr) return void res.status(400).json({ error: pinErr });
-  if (db.select({ id: members.id }).from(members).where(eq(members.pinHash, shaPin(pin))).all()[0]) {
+  if (pinTaken(pin)) {
     return void res.status(400).json({ error: 'PIN sudah dipakai' });
   }
-  if (!validDescriptors(descriptors)) return void res.status(400).json({ error: 'wajah invalid (burst dulu)' });
+  if (!noFace && !validDescriptors(descriptors)) return void res.status(400).json({ error: 'wajah invalid (burst dulu)' });
   let id = slugify(clean);
   for (let n = 2; db.select().from(members).where(eq(members.id, id)).all()[0]; n++) id = `${slugify(clean)}-${n}`;
   // TIDAK ADA foto wajah disimpan — cuma embedding (dienkripsi di bawah).
@@ -433,9 +538,9 @@ app.post('/api/register', (req, res) => {
   const count = db.select().from(members).all().length;
   db.insert(members).values({
     id, nama: clean, warna: PALETTE[count % PALETTE.length], divisi: 'acara',
-    foto: null, angkatan: year, jabatan: jab, pinHash: shaPin(pin),
+    foto: null, angkatan: year, jabatan: jab, pinHash: hashPin(pin), noFaceConsent: noFace ? 1 : 0,
   }).run();
-  db.insert(faces).values({ memberId: id, descriptors: encryptJson(descriptors), updatedAt: Date.now() }).run();
+  if (!noFace) db.insert(faces).values({ memberId: id, descriptors: encryptJson(descriptors), updatedAt: Date.now() }).run();
   res.json({ ok: true, memberId: id, nama: clean });
 });
 
@@ -447,25 +552,30 @@ app.put('/api/members/:id/foto', (req, res) => {
   const member = db.select().from(members).where(eq(members.id, id)).all()[0];
   if (!member) return void res.status(400).json({ error: 'anggota invalid' });
   if (!foto) {
-    // Kosongkan avatar (kembali ke dot warna).
-    if (member.foto) { try { fs.unlinkSync(path.join(UPLOAD_DIR, 'profil', `${id}.jpg`)); } catch { /* abaikan */ } }
+    // Kosongkan avatar (kembali ke dot warna). Hapus dua ekstensi (legacy .jpg).
+    for (const ext of ['webp', 'jpg']) {
+      try { fs.unlinkSync(path.join(UPLOAD_DIR, 'profil', `${id}.${ext}`)); } catch { /* abaikan */ }
+    }
     db.update(members).set({ foto: null }).where(eq(members.id, id)).run();
     return void res.json({ ok: true, foto: null });
   }
-  const saved = saveDataUrl(foto, path.join(UPLOAD_DIR, 'profil', `${id}.jpg`));
+  const saved = saveDataUrl(foto, path.join(UPLOAD_DIR, 'profil', `${id}.webp`));
   if (!saved) return void res.status(400).json({ error: 'foto invalid' });
-  const url = `/uploads/profil/${id}.jpg`;
+  const url = `/uploads/profil/${id}.webp`;
   db.update(members).set({ foto: url }).where(eq(members.id, id)).run();
   res.json({ ok: true, foto: url });
 });
 
 // ---- PIN login (alternatif wajah; absensi/check-in TETAP wajah) ----
-app.post('/api/login/pin', (req, res) => {
+app.post('/api/login/pin', rateLimit(10, 60_000), (req, res) => {
   const { pin } = (req.body ?? {}) as { pin: string };
   if (!/^\d{6,}$/.test(pin ?? '')) return void res.status(400).json({ error: 'PIN minimal 6 digit' });
-  const m = db.select().from(members).where(eq(members.pinHash, shaPin(pin))).all()[0];
+  const m = findByPin(pin);
   if (!m) return void res.status(401).json({ error: 'PIN salah' });
-  res.json({ ok: true, memberId: m.id, nama: m.nama });
+  // PIN benar = bukti identitas yg cukup utk token atestasi hari ini.
+  const tanggal = todayLocal();
+  const attest = issueAttest(m.id, tanggal);
+  res.json({ ok: true, memberId: m.id, nama: m.nama, attest, tanggal });
 });
 
 // Atur/ganti PIN sendiri (sudah login = sudah verifikasi wajah).
@@ -473,11 +583,11 @@ app.post('/api/pin/set', (req, res) => {
   const { memberId, pin } = (req.body ?? {}) as { memberId: string; pin: string };
   const member = db.select().from(members).where(eq(members.id, memberId)).all()[0];
   if (!member) return void res.status(400).json({ error: 'anggota invalid' });
-  const err = pinError(pin, member.angkatan ?? '');
+  const err = pinError(pin, member.angkatan ?? '', member.noFaceConsent ? 8 : 6);
   if (err) return void res.status(400).json({ error: err });
-  const taken = db.select({ id: members.id }).from(members).where(eq(members.pinHash, shaPin(pin))).all()[0];
-  if (taken && taken.id !== memberId) return void res.status(400).json({ error: 'PIN sudah dipakai' });
-  db.update(members).set({ pinHash: shaPin(pin) }).where(eq(members.id, memberId)).run();
+  const taken = pinTaken(pin, memberId);
+  if (taken) return void res.status(400).json({ error: 'PIN sudah dipakai' });
+  db.update(members).set({ pinHash: hashPin(pin) }).where(eq(members.id, memberId)).run();
   res.json({ ok: true });
 });
 
@@ -499,17 +609,20 @@ app.delete('/api/members/:id', (req, res) => {
     tx.delete(assessments).where(eq(assessments.memberId, id)).run();
     tx.delete(kehadiran).where(eq(kehadiran.memberId, id)).run();
     tx.delete(pushSubs).where(eq(pushSubs.memberId, id)).run();
+    tx.delete(attestIssued).where(eq(attestIssued.memberId, id)).run();
     tx.delete(lapsit).where(eq(lapsit.memberId, id)).run();
     tx.delete(attendance).where(eq(attendance.memberId, id)).run();
     tx.delete(evidence).where(eq(evidence.memberId, id)).run();
     tx.delete(faces).where(eq(faces.memberId, id)).run();
     tx.delete(roster).where(eq(roster.memberId, id)).run();
+    tx.delete(tasks).where(eq(tasks.memberId, id)).run();
     tx.delete(members).where(eq(members.id, id)).run();
   });
   try {
     for (const f of fs.readdirSync(UPLOAD_DIR, { recursive: true }) as string[]) {
       const base = path.basename(f);
-      if (base === `${id}.jpg` || base.includes(`_${id}_`)) fs.unlinkSync(path.join(UPLOAD_DIR, f));
+      const stem = base.replace(/\.(jpg|jpeg|png|webp)$/i, '');
+      if (stem === id || stem.includes(`_${id}_`)) fs.unlinkSync(path.join(UPLOAD_DIR, f));
     }
   } catch { /* best effort */ }
   res.json({ ok: true });
@@ -518,7 +631,7 @@ app.delete('/api/members/:id', (req, res) => {
 // embedding SEMUA anggota ke siapa pun tanpa auth, dan matching dilakukan di
 // browser (bisa dimanipulasi). Sekarang: matching cuma lewat endpoint ini,
 // descriptor tidak pernah keluar dari server.
-app.post('/api/faces/match', (req, res) => {
+app.post('/api/faces/match', rateLimit(30, 60_000), (req, res) => {
   const { descriptor } = (req.body ?? {}) as { descriptor: unknown };
   if (!Array.isArray(descriptor) || descriptor.length !== 128
     || !descriptor.every((x) => typeof x === 'number' && Number.isFinite(x))) {
@@ -534,7 +647,11 @@ app.post('/api/faces/match', (req, res) => {
     }
   }
   const hit = identifyFace(descriptor as number[], enrolled);
-  res.json({ hit });
+  if (!hit) return void res.json({ hit: null });
+  // Match lolos → terbitkan token atestasi hari ini (dipakai absen/evidence/lapsit).
+  const tanggal = todayLocal();
+  const attest = issueAttest(hit.memberId, tanggal);
+  res.json({ hit, attest, tanggal });
 });
 
 // Admin-only: jumlah wajah terdaftar per anggota (buat dashboard), TANPA
@@ -584,9 +701,9 @@ app.get('/api/attendance', (req, res) => {
 const onDutyAt = (tanggal: string, memberId: string): string | null => {
   const dow = new Date(tanggal + 'T00:00').getDay();
   if (dow < 1 || dow > 5) return null;
-  const ok = db.select().from(roster).where(eq(roster.day, DAYS[dow - 1])).all()
-    .some((r) => r.memberId === memberId);
-  return ok ? memberId : null;
+  const day = DAYS[dow - 1];
+  const rows = effectiveRosterDay(day, mondayOf(tanggal));
+  return rows.some((r) => r.memberId === memberId) ? memberId : null;
 };
 
 // Senin dari minggu yang memuat `tanggal` (YYYY-MM-DD).
@@ -596,6 +713,16 @@ const mondayOf = (tanggal: string): string => {
   const diff = dow === 0 ? -6 : 1 - dow;
   d.setDate(d.getDate() + diff);
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+};
+
+// Roster EFEKTIF 1 hari: override minggu tsb kalau ada, fallback template.
+// SEMUA gate piket (absen/evidence/lapsit/nilai/leaderboard) wajib lewat sini.
+const effectiveRosterDay = (day: string, week: string) => {
+  const eff = db.select().from(roster)
+    .where(and(eq(roster.weekStart, week), eq(roster.day, day))).all();
+  return eff.length
+    ? eff
+    : db.select().from(roster).where(and(isNull(roster.weekStart), eq(roster.day, day))).all();
 };
 
 // Jam selesai piket EFEKTIF utk member+tanggal (dipakai gate kirim lapsit).
@@ -615,17 +742,32 @@ const jamSelesaiAt = (tanggal: string, memberId: string): string | null => {
 };
 
 app.post('/api/attendance', (req, res) => {
-  const { tanggal, memberId } = (req.body ?? {}) as { tanggal: string; memberId: string };
+  const { tanggal, memberId, selfie, attest } = (req.body ?? {}) as { tanggal: string; memberId: string; selfie?: string; attest?: string };
   if (!/^\d{4}-\d{2}-\d{2}$/.test(tanggal ?? '')) return void res.status(400).json({ error: 'tanggal invalid' });
   const member = db.select().from(members).where(eq(members.id, memberId)).all()[0];
   if (!member) return void res.status(400).json({ error: 'anggota invalid' });
   if (!onDutyAt(tanggal, memberId)) return void res.status(400).json({ error: `${member.nama} tidak piket di tanggal itu` });
+  // Bukti identitas: token atestasi wajah/PIN hari ini — kecuali akun
+  // PIN-only yg wajib menyertakan selfie terenkripsi sebagai pengganti.
+  const selfieOk = member.noFaceConsent && selfie && /^data:image\/webp;base64,/.test(selfie);
+  if (!checkAttest(attest, memberId, tanggal) && !selfieOk) {
+    return void res.status(403).json({ error: 'verifikasi wajah dulu hari ini' });
+  }
   const already = db.select().from(attendance).all()
     .some((r) => r.tanggal === tanggal && r.memberId === memberId);
   if (already) return void res.json({ ok: true, already: true });
+  // Member yang menolak scan wajah (PIN-only) WAJIB selfie sbg bukti hadir
+  // pengganti face-match. Selfie dienkripsi AES-256-GCM at rest — dipakai
+  // sebagai bukti rekap admin, BUKAN utk matching algoritma apa pun.
+  if (member.noFaceConsent) {
+    if (!selfie || !/^data:image\/webp;base64,/.test(selfie)) {
+      return void res.status(400).json({ error: 'selfie wajib untuk akun tanpa wajah (PIN-only)' });
+    }
+  }
   const now = new Date();
   const jam = `${String(now.getHours()).padStart(2, '0')}.${String(now.getMinutes()).padStart(2, '0')}`;
-  db.insert(attendance).values({ tanggal, memberId, jam, createdAt: Date.now() }).run();
+  const selfieEnc = member.noFaceConsent && selfie ? encryptJson(selfie) : null;
+  db.insert(attendance).values({ tanggal, memberId, jam, createdAt: Date.now(), selfieEnc }).run();
   // Sinkron ke tabel kehadiran (tidak menimpa izin/sakit/alpa yang sudah ada).
   const kh = db.select().from(kehadiran).where(eq(kehadiran.tanggal, tanggal)).all()
     .find((k) => k.memberId === memberId);
@@ -635,13 +777,25 @@ app.post('/api/attendance', (req, res) => {
   res.json({ ok: true, jam });
 });
 
+// Selfie absen (terenkripsi) — HANYA admin/superadmin boleh minta lihat.
+app.get('/api/attendance/:id/selfie', requireAdmin, (req, res) => {
+  const row = db.select().from(attendance).where(eq(attendance.id, Number(req.params.id))).all()[0];
+  if (!row?.selfieEnc) return void res.status(404).json({ error: 'tidak ada selfie' });
+  try {
+    const dataUrl = decryptJson<string>(row.selfieEnc);
+    res.json({ selfie: dataUrl });
+  } catch {
+    res.status(500).json({ error: 'gagal dekripsi' });
+  }
+});
+
 // ---- bukti per tugas PER ORANG (tiap anggota upload fotonya sendiri) ----
 // Privasi: user biasa hanya bisa lihat foto miliknya sendiri (memberId wajib
 // & dipaksa cocok dgn query). Admin/superadmin (header x-admin-pin valid)
 // boleh lihat foto SIAPA PUN — dipakai di tab Mingguan admin & Superadmin.
 app.get('/api/evidence', (req, res) => {
   const { date, from, to, memberId } = req.query as Record<string, string | undefined>;
-  const isAdmin = req.header('x-admin-pin') === ADMIN_PIN;
+  const isAdmin = pinEq(req.header('x-admin-pin'), ADMIN_PIN);
   let rows = db.select().from(evidence).all();
   if (date) rows = rows.filter((r) => r.tanggal === date);
   if (from && to) rows = rows.filter((r) => r.tanggal >= from && r.tanggal <= to);
@@ -666,16 +820,18 @@ const ensureChecks = (tanggal: string, memberId: string) => {
 };
 
 app.post('/api/evidence', (req, res) => {
-  const { tanggal, memberId, tugas, dataUrl } = (req.body ?? {}) as {
-    tanggal: string; memberId: string; tugas: string; dataUrl: string;
+  const { tanggal, memberId, tugas, dataUrl, attest } = (req.body ?? {}) as {
+    tanggal: string; memberId: string; tugas: string; dataUrl: string; attest?: string;
   };
   if (!/^\d{4}-\d{2}-\d{2}$/.test(tanggal ?? '')) return void res.status(400).json({ error: 'tanggal invalid' });
   const member = db.select().from(members).where(eq(members.id, memberId)).all()[0];
   if (!member) return void res.status(400).json({ error: 'anggota invalid' });
+  if (!checkAttest(attest, memberId, tanggal)) {
+    return void res.status(403).json({ error: 'verifikasi wajah/PIN dulu hari ini' });
+  }
   const dow = new Date(tanggal + 'T00:00').getDay();
   const dayName = dow >= 1 && dow <= 5 ? DAYS[dow - 1] : null;
-  const onDuty = dayName
-    && db.select().from(roster).where(eq(roster.day, dayName)).all().some((r) => r.memberId === memberId);
+  const onDuty = dayName && onDutyAt(tanggal, memberId);
   if (!onDuty) return void res.status(400).json({ error: `${member.nama} tidak piket di tanggal itu` });
   const task = ensureChecks(tanggal, memberId).find((t) => t.judul === tugas);
   const master = !task
@@ -687,7 +843,7 @@ app.post('/api/evidence', (req, res) => {
   const buf = Buffer.from(m[2], 'base64');
   if (buf.length > 5 * 1024 * 1024) return void res.status(400).json({ error: 'foto >5MB' });
   const slug = tugas.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 30) || 'foto';
-  const fname = task ? `${tanggal}_task${task.id}_${memberId}.jpg` : `${tanggal}_${slug}_${memberId}.jpg`;
+  const fname = task ? `${tanggal}_task${task.id}_${memberId}.webp` : `${tanggal}_${slug}_${memberId}.webp`;
   const existing = db.select().from(evidence).all()
     .find((r) => r.tanggal === tanggal && r.tugas === tugas && r.memberId === memberId);
   if (existing) {
@@ -706,7 +862,7 @@ app.post('/api/evidence', (req, res) => {
 // boleh lihat semua — sama seperti evidence.
 app.get('/api/lapsit', (req, res) => {
   const { date, from, to, memberId } = req.query as Record<string, string | undefined>;
-  const isAdmin = req.header('x-admin-pin') === ADMIN_PIN;
+  const isAdmin = pinEq(req.header('x-admin-pin'), ADMIN_PIN);
   let rows = db.select().from(lapsit).all();
   if (date) rows = rows.filter((r) => r.tanggal === date);
   if (from && to) rows = rows.filter((r) => r.tanggal >= from && r.tanggal <= to);
@@ -720,13 +876,16 @@ app.get('/api/lapsit', (req, res) => {
 });
 
 app.post('/api/lapsit', (req, res) => {
-  const { tanggal, memberId, catatan, lat, lng, acc } = (req.body ?? {}) as {
+  const { tanggal, memberId, catatan, lat, lng, acc, attest } = (req.body ?? {}) as {
     tanggal: string; memberId: string; catatan: string;
-    lat?: string | null; lng?: string | null; acc?: number | null;
+    lat?: string | null; lng?: string | null; acc?: number | null; attest?: string;
   };
   if (!/^\d{4}-\d{2}-\d{2}$/.test(tanggal ?? '')) return void res.status(400).json({ error: 'tanggal invalid' });
   const member = db.select().from(members).where(eq(members.id, memberId)).all()[0];
   if (!member) return void res.status(400).json({ error: 'anggota invalid' });
+  if (!checkAttest(attest, memberId, tanggal)) {
+    return void res.status(403).json({ error: 'verifikasi wajah/PIN dulu hari ini' });
+  }
   if (!onDutyAt(tanggal, memberId)) return void res.status(400).json({ error: `${member.nama} tidak piket di tanggal itu` });
   // Lapsit cuma boleh dikirim maks 30 menit SEBELUM jam selesai piket
   // (jam diatur admin di jadwal, ikut override minggu berjalan kalau ada).
@@ -832,7 +991,8 @@ app.get('/api/nilai/leaderboard', (req, res) => {
     const dow = d.getDay();
     if (dow >= 1 && dow <= 5) {
       const day = DAYS[dow - 1];
-      const crew = new Set(db.select().from(roster).where(eq(roster.day, day)).all().map((r) => r.memberId));
+      const week = mondayOf(tanggal);
+      const crew = new Set(effectiveRosterDay(day, week).map((r) => r.memberId));
       for (const mid of crew) {
         const m = allMembers.find((x) => x.id === mid);
         const e = (by[mid] ??= { nama: m?.nama ?? mid, vals: [] });
@@ -1159,6 +1319,59 @@ app.put('/api/settings', requireSuper, (req, res) => {
   }
   res.json({ ok: true });
 });
+
+// ---- pengingat H-1 (jam 19:00) ke yg piket besok ----
+// Jalan in-process tiap menit; di serverless TIDAK jalan — produksi pakai
+// cron eksternal yg hit POST /api/cron/reminder (super PIN).
+const runH1Reminder = async (forceDate?: string): Promise<{ sent: number; tanggal: string }> => {
+  const t = new Date();
+  const today = forceDate ?? `${t.getFullYear()}-${String(t.getMonth() + 1).padStart(2, '0')}-${String(t.getDate()).padStart(2, '0')}`;
+  const tm = new Date(t.getFullYear(), t.getMonth(), t.getDate() + 1);
+  const tanggal = `${tm.getFullYear()}-${String(tm.getMonth() + 1).padStart(2, '0')}-${String(tm.getDate()).padStart(2, '0')}`;
+  const sentKey = `reminder_sent_${today}`;
+  const already = db.select().from(settings).where(eq(settings.key, sentKey)).all()[0];
+  if (already && !forceDate) return { sent: 0, tanggal };
+  const dow = tm.getDay();
+  if (dow >= 1 && dow <= 5) {
+    const day = DAYS[dow - 1];
+    const week = mondayOf(tanggal);
+    const crew = effectiveRosterDay(day, week);
+    for (const r of crew) {
+      const m = db.select().from(members).where(eq(members.id, r.memberId)).all()[0];
+      if (!m) continue;
+      await sendPush(
+        r.memberId, 'Besok giliran piket',
+        `${m.nama}, besok (${day}) piket ${r.jamMulai}–${r.jamSelesai}. Jangan lupa!`, '/',
+      );
+    }
+    if (crew.length && !already) {
+      db.insert(settings).values({ key: sentKey, value: tanggal }).run();
+    }
+    // Bersih-bersih penanda lama.
+    for (const s of db.select().from(settings).all()) {
+      if (s.key.startsWith('reminder_sent_') && s.key !== sentKey) {
+        db.delete(settings).where(eq(settings.key, s.key)).run();
+      }
+    }
+    return { sent: crew.length, tanggal };
+  }
+  return { sent: 0, tanggal };
+};
+
+app.post('/api/cron/reminder', requireSuper, async (req, res) => {
+  const { force } = (req.body ?? {}) as { force?: boolean };
+  const r = await runH1Reminder(force ? todayLocal() : undefined);
+  res.json({ ok: true, ...r });
+});
+
+setInterval(() => {
+  try {
+    const t = new Date();
+    if (t.getHours() === 19 && t.getMinutes() < 5) void runH1Reminder();
+  } catch (e) {
+    console.warn('H-1 scheduler error:', (e as Error).message);
+  }
+}, 60_000);
 
 const port = Number(process.env.PORT ?? 3001);
 app.listen(port, () => console.log(`piket-menwa API :${port} (db=${process.env.DB_FILE ?? './dev.db'})`));

@@ -4,7 +4,7 @@ import {
   dateStr, load, save, type DayKey,
 } from './piket';
 
-export interface Member { id: string; nama: string; warna: string; divisi: string; foto: string | null; angkatan: string | null; jabatan: string | null; lastSeen: number | null }
+export interface Member { id: string; nama: string; warna: string; divisi: string; foto: string | null; angkatan: string | null; jabatan: string | null; lastSeen: number | null; noFaceConsent: number }
 export interface TaskRow { id: number; tanggal: string; judul: string; done: number; sort: number }
 export interface SwapRow {
   id: string; requester: string; target: string;
@@ -341,14 +341,42 @@ export async function loadFaceSummary(): Promise<FaceSummary[]> {
   return (await getAuthed<FaceSummary[]>('/api/faces/summary')) ?? [];
 }
 
+// Token atestasi wajah/PIN hari ini (bukti identitas ke server).
+// Disimpan per member+tanggal; logout menghapus semuanya.
+const attestKey = (memberId: string, tanggal: string) => `piket-attest:${tanggal}:${memberId}`;
+export const saveAttest = (memberId: string, tanggal: string, token: string) => {
+  try { sessionStorage.setItem(attestKey(memberId, tanggal), token); } catch { /* abaikan */ }
+};
+export const getAttest = (memberId: string, tanggal: string): string | undefined => {
+  try { return sessionStorage.getItem(attestKey(memberId, tanggal)) ?? undefined; }
+  catch { return undefined; }
+};
+export const clearAttest = () => {
+  try {
+    const rm: string[] = [];
+    for (let i = 0; i < sessionStorage.length; i++) {
+      const k = sessionStorage.key(i);
+      if (k?.startsWith('piket-attest:')) rm.push(k);
+    }
+    rm.forEach((k) => sessionStorage.removeItem(k));
+  } catch { /* abaikan */ }
+};
+
 // Cocokkan 1 descriptor (hasil scan kamera device sendiri) ke server —
 // server yang simpan & bandingkan SEMUA embedding, client cuma terima hasil
 // {memberId, ambiguous}, tidak pernah menerima vektor member lain.
 export async function matchFace(descriptor: number[]): Promise<{ memberId: string; ambiguous?: boolean } | null> {
-  const r = await postJson<{ hit: { memberId: string; distance: number; ambiguous?: boolean } | null }>(
+  const r = await postJson<{
+    hit: { memberId: string; distance: number; ambiguous?: boolean } | null;
+    attest?: string; tanggal?: string;
+  }>(
     '/api/faces/match', { descriptor },
   );
-  return r?.hit ?? null;
+  if (r?.hit) {
+    if (r.attest && r.tanggal) saveAttest(r.hit.memberId, r.tanggal, r.attest);
+    return r.hit;
+  }
+  return null;
 }
 
 export async function saveFaces(
@@ -377,8 +405,18 @@ export async function loadAttendance(from: string, to: string): Promise<AttRow[]
   return get<AttRow[]>(`/api/attendance?from=${from}&to=${to}`);
 }
 
-export async function markAttendance(tanggal: string, memberId: string): Promise<boolean> {
-  return post('/api/attendance', { tanggal, memberId });
+export async function markAttendance(tanggal: string, memberId: string, selfie?: string): Promise<{ ok: boolean; error?: string }> {
+  try {
+    const r = await fetch('/api/attendance', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ tanggal, memberId, selfie, attest: getAttest(memberId, tanggal) }),
+    });
+    const j = (await r.json()) as { error?: string };
+    return r.ok ? { ok: true } : { ok: false, error: j.error ?? 'gagal absen' };
+  } catch {
+    return { ok: false, error: 'offline — butuh online untuk absen' };
+  }
 }
 
 // Heartbeat presence (fire-and-forget, tanpa PIN).
@@ -398,14 +436,15 @@ export const isOnline = (m: { lastSeen: number | null }) =>
 // CATATAN PRIVASI: TIDAK ADA parameter foto lagi — cuma embedding wajah yang
 // dikirim (server enkripsi & simpan sebagai vektor, bukan gambar). Kalau mau
 // avatar profil, upload TERPISAH lewat setProfilePhoto() setelah login.
+// Kalau consentWajah=false: descriptors dikirim [] (tidak dipakai server).
 export async function registerMember(
-  nama: string, angkatan: string, jabatan: string, pin: string, descriptors: number[][],
+  nama: string, angkatan: string, jabatan: string, pin: string, descriptors: number[][], noFaceConsent = false,
 ): Promise<{ ok: boolean; memberId?: string; error?: string }> {
   try {
     const r = await fetch('/api/register', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ nama, angkatan, jabatan, pin, descriptors }),
+      body: JSON.stringify({ nama, angkatan, jabatan, pin, descriptors, noFaceConsent }),
     });
     const j = (await r.json()) as { memberId?: string; error?: string };
     return r.ok ? { ok: true, memberId: j.memberId } : { ok: false, error: j.error ?? 'gagal' };
@@ -438,7 +477,8 @@ export async function loginPin(pin: string): Promise<{ ok: boolean; memberId?: s
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ pin }),
     });
-    const j = (await r.json()) as { memberId?: string; nama?: string; error?: string };
+    const j = (await r.json()) as { memberId?: string; nama?: string; attest?: string; tanggal?: string; error?: string };
+    if (r.ok && j.memberId && j.attest && j.tanggal) saveAttest(j.memberId, j.tanggal, j.attest);
     return r.ok ? { ok: true, memberId: j.memberId, nama: j.nama } : { ok: false, error: j.error ?? 'gagal' };
   } catch {
     return { ok: false, error: 'offline — butuh online untuk masuk' };
@@ -489,7 +529,7 @@ export async function uploadEvidence(
     const r = await fetch('/api/evidence', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ tanggal, memberId, tugas, dataUrl }),
+      body: JSON.stringify({ tanggal, memberId, tugas, dataUrl, attest: getAttest(memberId, tanggal) }),
     });
     const j = (await r.json()) as { file?: string; error?: string };
     return r.ok ? { ok: true, file: j.file } : { ok: false, error: j.error ?? 'gagal' };
@@ -521,6 +561,7 @@ export async function submitLapsit(
         lat: geo ? String(geo.lat) : null,
         lng: geo ? String(geo.lng) : null,
         acc: geo ? geo.acc : null,
+        attest: getAttest(memberId, tanggal),
       }),
     });
     const j = (await r.json()) as { error?: string };

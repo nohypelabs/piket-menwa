@@ -11,7 +11,7 @@ import {
   TriangleAlert, X,
 } from 'lucide-react';
 import {
-  cancelSwapRemote, clearPin, clearWeekRosterRemote, createSwapRemote, decideSwapRemote,
+  cancelSwapRemote, clearPin, clearAttest, clearWeekRosterRemote, createSwapRemote, decideSwapRemote,
   dropPush, ensurePush, loadAttendance, loadBreakdown, loadChecks, loadEvidence, loadFaceSummary,
   loadNilaiToday, matchFace,
   loadLapsit, loadState, loadWeekRoster, localChecks, loginPin, markAttendance, ping, isOnline,
@@ -663,6 +663,7 @@ export default function App() {
   const [bdOpen, setBdOpen] = useState<Record<number, boolean>>({});
   const [buktiOpen, setBuktiOpen] = useState(true);
   const [bdDone, setBdDone] = useState<string[]>([]);
+  const [bdSecOpen, setBdSecOpen] = useState(false);
   const [nilaiHariIni, setNilaiHariIni] = useState<number | null>(null);
   const [faces, setFaces] = useState<FaceSummary[]>([]);
   const [att, setAtt] = useState<AttRow[]>([]);
@@ -695,6 +696,7 @@ export default function App() {
   const [pinMsg, setPinMsg] = useState<string | null>(null);
   const [avatarBusy, setAvatarBusy] = useState(false);
   const avatarInputRef = useRef<HTMLInputElement>(null);
+  const selfieInputRef = useRef<HTMLInputElement>(null);
 
   // Foto profil OPSIONAL (avatar) — file dipilih manual dari galeri/kamera,
   // BUKAN dari proses scan wajah biometrik. Dikompres dulu spy hemat data.
@@ -1112,9 +1114,40 @@ export default function App() {
     if (!crew.includes(me)) {
       return alert('Kamu tidak ada jadwal hari ini — minta Admin susun roster dulu (tab Mingguan, mode Admin).');
     }
+    if (meMember.noFaceConsent) {
+      // Akun PIN-only: absen via selfie+watermark (bukan face-match).
+      selfieInputRef.current?.click();
+      return;
+    }
     warmAudio();
     setCamMsg(null);
     setCam({ mode: 'absen' });
+  };
+
+  const onSelfieAbsen = async (f: File | undefined) => {
+    if (!f || !meMember) return;
+    setAvatarBusy(true);
+    try {
+      const g = (await getGeo()) ?? geo;
+      if (g) setGeo(g);
+      const dataUrl = await stampPhoto(f, g, 1280, meMember.nama);
+      const res = await markAttendance(dateStr(0), me, dataUrl);
+      if (!res.ok) {
+        setToast({ msg: res.error ?? 'Gagal absen.', kind: 'error' });
+        return;
+      }
+      const a = await loadAttendance(dateStr(0), dateStr(0));
+      if (a) setAtt(a);
+      setUnlocked(true);
+      try { sessionStorage.setItem(unlockKey(me), dateStr(0)); } catch { /* abaikan */ }
+      ting(990, 0.18);
+      setToast({ msg: 'Absen berhasil — checklist & bukti terbuka', kind: 'ok' });
+      void ensurePush(me);
+    } catch {
+      setToast({ msg: 'Baca/kompres foto gagal.', kind: 'error' });
+    } finally {
+      setAvatarBusy(false);
+    }
   };
 
   const loginCam = () => {
@@ -1126,6 +1159,7 @@ export default function App() {
 
   const logout = () => {
     void dropPush();
+    clearAttest();
     try { if (me) sessionStorage.removeItem(unlockKey(me)); } catch { /* abaikan */ }
     setMe('');
     setUnlocked(false);
@@ -1138,9 +1172,42 @@ export default function App() {
     setRegJabatan(p.jabatan);
     setRegPin(p.pin);
     setProfiling(false);
+    if (!p.consentWajah) {
+      // Menolak scan wajah → daftar langsung tanpa kamera, PIN jadi satu-satunya kunci.
+      void finishRegister(p.nama, p.angkatan, p.jabatan, p.pin, [], true);
+      return;
+    }
     warmAudio();
     setCamMsg('Tap Mulai, ikuti tahap: tahan – kanan – kiri');
     setCam({ mode: 'register' });
+  };
+
+  const finishRegister = async (
+    namaV: string, angkatanV: string, jabatanV: string, pinV: string, ds: number[][], noFaceConsent: boolean,
+  ) => {
+    const res = await registerMember(namaV, angkatanV, jabatanV, pinV, ds, noFaceConsent);
+    if (res.ok && res.memberId) {
+      const hello = `${namaV} (${jabatanV}, angkatan ${angkatanV})`;
+      await refresh();
+      setMe(res.memberId);
+      setUnlocked(!noFaceConsent); // PIN-only: tidak ada verifikasi wajah, tetap terkunci sampai login PIN eksplisit
+      if (!noFaceConsent) {
+        try { sessionStorage.setItem(unlockKey(res.memberId), dateStr(0)); } catch { /* abaikan */ }
+      }
+      if (res.memberId) void ensurePush(res.memberId);
+      void getGeo().then(setGeo);
+      setRegName('');
+      setRegAngkatan('');
+      setRegJabatan('');
+      setRegPin('');
+      setProfiling(false);
+      setCam(null);
+      setCamMsg(null);
+      alert('Pendaftaran berhasil — kamu masuk sebagai ' + hello);
+    } else {
+      setCamMsg(res.error ?? 'Gagal daftar.');
+      setToast({ msg: res.error ?? 'Gagal daftar.', kind: 'error' });
+    }
   };
 
   // Duplikat ketahuan di tahap 1 → tolak cepat tanpa menunggu 3 tahap.
@@ -1486,7 +1553,7 @@ export default function App() {
       <div className="phone tac">
         {profiling
           ? <ProfilePage onDone={onProfileDone} onCancel={() => setProfiling(false)} names={members.map((m) => m.nama)} existing={members.map((m) => ({ nama: m.nama, angkatan: m.angkatan }))} />
-          : <WelcomePage onTap={loginCam} onRegister={() => setProfiling(true)} />}
+          : <WelcomePage onTap={loginCam} onRegister={() => setProfiling(true)} onPinLogin={pinLogin} />}
         <AnimatePresence>
           {showUnknown && (
             <motion.div
@@ -1670,13 +1737,32 @@ export default function App() {
               <div className="hero"><b><PartyPopper size={17} /> Libur</b><span>Sabtu–Minggu tidak ada piket.</span></div>
             ) : (
               <div className="hero">
-                <div className="herorow">
-                  <i className="pdot" style={{ background: warna(crew[0] ?? '') }} />
-                  <div>
-                    <b>{crew.map(nama).join(' & ') || '—'}</b>
-                    <span>Piket hari ini • {jamHari}</span>
-                  </div>
+                <div className="herotop">
                   <em className="pill">hari ini</em>
+                  <span className="hday">{today}</span>
+                </div>
+                <div className="heroatt">
+                  {crew.map((id) => {
+                    const row = att.find((a) => a.memberId === id);
+                    const m = members.find((x) => x.id === id);
+                    return (
+                      <div key={id} className="attrow ghost">
+                        {m?.foto
+                          ? <img className="ava" src={m.foto} alt={nama(id)} />
+                          : <i style={{ background: warna(id) }} />}
+                        <span>{nama(id)}</span>
+                        {m && isOnline(m) && <i className="onlinedot" title="online" />}
+                        <em className={row ? 'badge-ok' : 'badge-no'}>{row ? `hadir ${row.jam}` : 'belum'}</em>
+                      </div>
+                    );
+                  })}
+                  {crew.length === 0 && <span className="hint">Belum ada jadwal.</span>}
+                </div>
+                <div className="herojam">
+                  <Clock size={14} />
+                  <span className="jlabel">mulai</span><b>{(jamHari.split('–')[0] ?? '').trim()}</b>
+                  <span className="jarrow">→</span>
+                  <span className="jlabel">selesai</span><b>{(jamHari.split('–')[1] ?? '').trim()}</b>
                 </div>
               </div>
             )}
@@ -1685,20 +1771,6 @@ export default function App() {
                 {mySlots.length === 0 && (
                   <p className="hint">Kamu belum masuk roster minggu ini — minta Admin tambahkan via tab Mingguan (mode Admin).</p>
                 )}
-                <h2>Kehadiran</h2>
-                <div className="attlist">
-                  {crew.map((id) => {
-                    const row = att.find((a) => a.memberId === id);
-                    const m = members.find((x) => x.id === id);
-                    return (
-                      <div key={id} className="attrow">
-                        <i style={{ background: warna(id) }} /><span>{nama(id)}</span>
-                        {m && isOnline(m) && <i className="onlinedot" title="online" />}
-                        <em className={row ? 'badge-ok' : 'badge-no'}>{row ? `hadir ${row.jam}` : 'belum'}</em>
-                      </div>
-                    );
-                  })}
-                </div>
                 {crew.includes(me) && !unlocked && (
                   <button className="bigbtn" onClick={needVerify}>
                     {att.some((a) => a.memberId === me) ? <><LockOpen size={15} /> Verifikasi wajah (buka checklist)</> : <><Camera size={15} /> Absen tiba (selfie wajah)</>}
@@ -1759,7 +1831,22 @@ export default function App() {
                     )}
                   </AnimatePresence>
                 </div>
-                <h2>Rincian Tugas (Opsional)</h2>
+                <div className="bdgroup top">
+                  <button className="bdhead" onClick={() => setBdSecOpen((v) => !v)}>
+                    <span>Rincian Tugas (Opsional)</span>
+                    <em>{bdDone.length}/{BREAKDOWN.reduce((s, g) => s + g.items.length, 0)}</em>
+                    <ChevronDown size={16} className={bdSecOpen ? 'rot' : ''} />
+                  </button>
+                </div>
+                <AnimatePresence initial={false}>
+                  {bdSecOpen && (
+                    <motion.div
+                      initial={{ height: 0, opacity: 0 }}
+                      animate={{ height: 'auto', opacity: 1 }}
+                      exit={{ height: 0, opacity: 0 }}
+                      transition={{ duration: 0.22, ease: 'easeOut' }}
+                      style={{ overflow: 'hidden' }}
+                    >
                 <p className="hint">
                   Tercatat di server, ikut menentukan nilai piketmu.
                   {nilaiHariIni != null && <> Nilai hari ini: <b>{nilaiHariIni}</b>/100.</>}
@@ -1800,6 +1887,9 @@ export default function App() {
                     </div>
                   );
                 })}
+                    </motion.div>
+                  )}
+                </AnimatePresence>
                 <h2>Catatan Lapsit — Akhir Piket</h2>
                 {lapsit.length > 0 ? (
                   lapsit.map((l) => (
@@ -1844,6 +1934,7 @@ export default function App() {
 
         {tab === 'minggu' && (
           <>
+            <div className="minggufill">
             <div className="weeknav">
               <b>{rangeLabel}</b>
               <span>
@@ -1873,9 +1964,18 @@ export default function App() {
                 return (
                   <div key={d} className={`dayrow ${isToday ? 'now' : ''}`}>
                     <div className="dleft"><b>{ABBR[i]}</b><span>{new Date(ds + 'T00:00').getDate()}</span></div>
-                    <div className="dmain">
-                      <span className="dots">{crewIds.map((id) => <i key={id} style={{ background: warna(id) }} />)}</span>
-                      <span className="dnames">{crewIds.map(nama).join(' • ') || '—'}</span>
+                  <div className="dmain">
+                    <span className="crewchips">{crewIds.map((id) => {
+                      const m = members.find((x) => x.id === id);
+                      return (
+                        <span key={id} className="chip sm">
+                          {m?.foto
+                            ? <img className="ava xs" src={m.foto} alt={nama(id)} />
+                            : <i style={{ background: warna(id) }} />}
+                          {nama(id)}
+                        </span>
+                      );
+                    })}{crewIds.length === 0 && <span className="hint">—</span>}</span>
                       {admin && (
                         <span className="dedit">
                           {crewIds.map((id) => (
@@ -1933,6 +2033,7 @@ export default function App() {
                 );
               })
             )}
+            </div>
             {approvedSwaps.length > 0 && (
               <div className="swaplog">
                 <b>Hasil tukar jadwal</b>
@@ -2061,6 +2162,10 @@ export default function App() {
         <div className="progress"><i style={{ width: `${(doneCount / checks.length) * 100}%` }} /></div>
       )}
       <AnimatePresence>{camModal}</AnimatePresence>
+      <input
+        ref={selfieInputRef} type="file" accept="image/*" capture="user" hidden
+        onChange={(e) => { void onSelfieAbsen(e.target.files?.[0]); e.target.value = ''; }}
+      />
       <AnimatePresence>
         {toast && <Toast t={toast} onClose={() => setToast(null)} />}
       </AnimatePresence>
