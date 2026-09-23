@@ -82,3 +82,35 @@ export function stampPhoto(file: File, geo: Geo | null, maxDim = 1280, quality =
     img.src = url;
   });
 }
+
+// Kompresi polos tanpa stempel apa pun (dipakai utk avatar profil — beda
+// dari stampPhoto() yang membakar tanggal/jam/koordinat, itu khusus bukti piket).
+export function compressPhoto(file: File, maxDim = 480, quality = 0.85): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => {
+      try {
+        const scale = Math.min(1, maxDim / Math.max(img.width, img.height));
+        const w = Math.round(img.width * scale);
+        const h = Math.round(img.height * scale);
+        const c = document.createElement('canvas');
+        c.width = w;
+        c.height = h;
+        const ctx = c.getContext('2d');
+        if (!ctx) throw new Error('canvas gagal');
+        ctx.drawImage(img, 0, 0, w, h);
+        URL.revokeObjectURL(url);
+        resolve(c.toDataURL('image/jpeg', quality));
+      } catch (e) {
+        URL.revokeObjectURL(url);
+        reject(e);
+      }
+    };
+    img.onerror = () => {
+      URL.revokeObjectURL(url);
+      reject(new Error('baca foto gagal'));
+    };
+    img.src = url;
+  });
+}

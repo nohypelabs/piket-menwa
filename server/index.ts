@@ -2,25 +2,56 @@ import cors from 'cors';
 import { and, eq, isNull } from 'drizzle-orm';
 import express from 'express';
 import fs from 'node:fs';
-import { createHash } from 'node:crypto';
+import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
 import path from 'node:path';
 import webpush from 'web-push';
 import { db } from '../db/client.ts';
-import { attendance, evidence, faces, lapsit, members, pushSubs, roster, swaps, tasks } from '../db/schema.sqlite.ts';
+import { attendance, evidence, faces, lapsit, members, pushSubs, roster, swaps, tasks, breakdown } from '../db/schema.sqlite.ts';
 import {
   assessments, assessmentItems, itemKoreksi, kehadiran, settings, tugasMaster,
 } from '../db/schema.sqlite.ts';
 import { NILAI_MASTER, hitungNilai } from '../db/nilai_master.ts';
+import { encryptJson, decryptJson } from '../db/crypto.ts';
+import { identify as identifyFace, type Enrolled } from '../db/face_match.ts';
 
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: '12mb' })); // foto dikirim sebagai dataURL terkompresi
 
-// File bukti: ./uploads (nanti: Supabase Storage). Tanpa login —
-// identitas = pilihan "Saya" di HP, server hanya validasi hari piket.
+// File: ./uploads (nanti: Supabase Storage). Struktur sekarang:
+//   uploads/profil/*  → avatar profil OPSIONAL (bukan data biometrik), tetap
+//                        diserve publik apa adanya — risikonya rendah.
+//   uploads/evidence/* → foto Bukti Piket, BUKAN publik. Akses cuma lewat
+//                        signed URL (HMAC, expired 60 detik, lihat di bawah)
+//                        supaya tidak ada link permanen yang bisa disebar.
 const UPLOAD_DIR = process.env.UPLOAD_DIR ?? './uploads';
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
-app.use('/uploads', express.static(path.resolve(UPLOAD_DIR)));
+app.use('/uploads/profil', express.static(path.resolve(UPLOAD_DIR, 'profil')));
+
+// ---- signed URL utk foto bukti piket: HMAC(path, exp) pakai FACE_ENC_KEY ----
+// (key sama dgn enkripsi embedding — cukup 1 secret utk keperluan dev ini;
+// saat pindah Supabase, ganti pola ini dengan signed URL Supabase Storage asli.)
+const SIGN_KEY = process.env.FACE_ENC_KEY ?? 'dev-only-insecure-key-ganti-di-.env';
+function signPath(relPath: string, expMs: number): string {
+  const h = createHmac('sha256', SIGN_KEY).update(`${relPath}:${expMs}`).digest('hex');
+  return h;
+}
+function makeSignedEvidenceUrl(relPath: string): string {
+  const exp = Date.now() + 60_000; // 60 detik
+  const sig = signPath(relPath, exp);
+  return `/uploads-signed/${relPath}?exp=${exp}&sig=${sig}`;
+}
+app.get('/uploads-signed/evidence/:file', (req, res) => {
+  const relPath = `evidence/${req.params.file}`;
+  const exp = Number(req.query.exp);
+  const sig = String(req.query.sig ?? '');
+  if (!exp || !sig || Date.now() > exp) return void res.status(403).send('link kedaluwarsa');
+  const expected = signPath(relPath, exp);
+  const a = Buffer.from(sig, 'hex');
+  const b = Buffer.from(expected, 'hex');
+  if (a.length !== b.length || !timingSafeEqual(a, b)) return void res.status(403).send('signature invalid');
+  res.sendFile(path.resolve(UPLOAD_DIR, relPath));
+});
 
 const DAYS = ['Senin', 'Selasa', 'Rabu', 'Kamis', 'Jumat'] as const;
 
@@ -189,22 +220,25 @@ app.delete('/api/roster/week', requireAdmin, (req, res) => {
   res.json({ ok: true });
 });
 
-// ---- checklist per tanggal (auto-clone dari template) ----
+// ---- checklist per tanggal PER ORANG (auto-clone dari template) ----
 app.get('/api/checks', (req, res) => {
   const date = String(req.query.date ?? '');
+  const memberId = String(req.query.memberId ?? '');
   if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return void res.status(400).json({ error: 'date=YYYY-MM-DD' });
-  let rows = db.select().from(tasks).where(eq(tasks.tanggal, date)).all();
+  if (!memberId) return void res.status(400).json({ error: 'memberId wajib' });
+  let rows = db.select().from(tasks).where(and(eq(tasks.tanggal, date), eq(tasks.memberId, memberId))).all();
   if (rows.length === 0) {
     const tpl = db.select().from(tasks).where(eq(tasks.tanggal, 'template')).all();
-    for (const t of tpl) db.insert(tasks).values({ tanggal: date, judul: t.judul, done: 0, sort: t.sort }).run();
-    rows = db.select().from(tasks).where(eq(tasks.tanggal, date)).all();
+    for (const t of tpl) db.insert(tasks).values({ tanggal: date, memberId, judul: t.judul, done: 0, sort: t.sort }).run();
+    rows = db.select().from(tasks).where(and(eq(tasks.tanggal, date), eq(tasks.memberId, memberId))).all();
   }
   res.json(rows.sort((a, b) => a.sort - b.sort));
 });
 
 app.post('/api/checks/toggle', (req, res) => {
-  const { date, judul } = req.body as { date: string; judul: string };
-  const row = db.select().from(tasks).where(eq(tasks.tanggal, date)).all().find((t) => t.judul === judul);
+  const { date, memberId, judul } = req.body as { date: string; memberId: string; judul: string };
+  const row = db.select().from(tasks).where(and(eq(tasks.tanggal, date), eq(tasks.memberId, memberId))).all()
+    .find((t) => t.judul === judul);
   if (!row) return void res.status(404).json({ error: 'tugas tidak ditemukan' });
   db.update(tasks).set({ done: row.done ? 0 : 1 }).where(eq(tasks.id, row.id)).run();
   res.json({ ok: true, done: row.done ? 0 : 1 });
@@ -373,8 +407,8 @@ const pinError = (pin: string, angkatan: string): string | null => {
 };
 
 app.post('/api/register', (req, res) => {
-  const { nama, angkatan, jabatan, pin, descriptors, foto } = (req.body ?? {}) as {
-    nama: string; angkatan: string; jabatan: string; pin: string; descriptors: unknown; foto: string;
+  const { nama, angkatan, jabatan, pin, descriptors } = (req.body ?? {}) as {
+    nama: string; angkatan: string; jabatan: string; pin: string; descriptors: unknown;
   };
   const clean = (nama ?? '').trim().replace(/\s+/g, ' ').slice(0, 30);
   if (clean.length < 5) return void res.status(400).json({ error: 'nama minimal 5 huruf' });
@@ -393,15 +427,36 @@ app.post('/api/register', (req, res) => {
   if (!validDescriptors(descriptors)) return void res.status(400).json({ error: 'wajah invalid (burst dulu)' });
   let id = slugify(clean);
   for (let n = 2; db.select().from(members).where(eq(members.id, id)).all()[0]; n++) id = `${slugify(clean)}-${n}`;
-  const fotoFile = saveDataUrl(foto ?? '', path.join(UPLOAD_DIR, 'faces', `${id}.jpg`));
-  if (!fotoFile) return void res.status(400).json({ error: 'foto wajah wajib' });
+  // TIDAK ADA foto wajah disimpan — cuma embedding (dienkripsi di bawah).
+  // Kalau member mau avatar, upload foto profil TERPISAH via /api/members/:id/foto
+  // (bukan dari proses scan biometrik ini).
   const count = db.select().from(members).all().length;
   db.insert(members).values({
     id, nama: clean, warna: PALETTE[count % PALETTE.length], divisi: 'acara',
-    foto: `/uploads/faces/${id}.jpg`, angkatan: year, jabatan: jab, pinHash: shaPin(pin),
+    foto: null, angkatan: year, jabatan: jab, pinHash: shaPin(pin),
   }).run();
-  db.insert(faces).values({ memberId: id, descriptors: JSON.stringify(descriptors), updatedAt: Date.now() }).run();
+  db.insert(faces).values({ memberId: id, descriptors: encryptJson(descriptors), updatedAt: Date.now() }).run();
   res.json({ ok: true, memberId: id, nama: clean });
+});
+
+// Foto profil OPSIONAL (avatar tampilan), terpisah total dari data biometrik
+// wajah. Member cuma bisa ganti fotonya sendiri (tidak perlu PIN admin).
+app.put('/api/members/:id/foto', (req, res) => {
+  const { id } = req.params;
+  const { foto } = (req.body ?? {}) as { foto: string };
+  const member = db.select().from(members).where(eq(members.id, id)).all()[0];
+  if (!member) return void res.status(400).json({ error: 'anggota invalid' });
+  if (!foto) {
+    // Kosongkan avatar (kembali ke dot warna).
+    if (member.foto) { try { fs.unlinkSync(path.join(UPLOAD_DIR, 'profil', `${id}.jpg`)); } catch { /* abaikan */ } }
+    db.update(members).set({ foto: null }).where(eq(members.id, id)).run();
+    return void res.json({ ok: true, foto: null });
+  }
+  const saved = saveDataUrl(foto, path.join(UPLOAD_DIR, 'profil', `${id}.jpg`));
+  if (!saved) return void res.status(400).json({ error: 'foto invalid' });
+  const url = `/uploads/profil/${id}.jpg`;
+  db.update(members).set({ foto: url }).where(eq(members.id, id)).run();
+  res.json({ ok: true, foto: url });
 });
 
 // ---- PIN login (alternatif wajah; absensi/check-in TETAP wajah) ----
@@ -459,8 +514,38 @@ app.delete('/api/members/:id', (req, res) => {
   } catch { /* best effort */ }
   res.json({ ok: true });
 });
-app.get('/api/faces', (_req, res) => {
-  res.json(db.select().from(faces).all());
+// Endpoint publik LAMA (GET /api/faces) DIHAPUS — dulu mengekspos raw
+// embedding SEMUA anggota ke siapa pun tanpa auth, dan matching dilakukan di
+// browser (bisa dimanipulasi). Sekarang: matching cuma lewat endpoint ini,
+// descriptor tidak pernah keluar dari server.
+app.post('/api/faces/match', (req, res) => {
+  const { descriptor } = (req.body ?? {}) as { descriptor: unknown };
+  if (!Array.isArray(descriptor) || descriptor.length !== 128
+    || !descriptor.every((x) => typeof x === 'number' && Number.isFinite(x))) {
+    return void res.status(400).json({ error: 'descriptor invalid' });
+  }
+  const rows = db.select().from(faces).all();
+  const enrolled: Enrolled[] = [];
+  for (const r of rows) {
+    try {
+      enrolled.push({ memberId: r.memberId, descriptors: decryptJson<number[][]>(r.descriptors) });
+    } catch (e) {
+      console.warn(`face row ${r.memberId} gagal didekripsi (key salah / data korup), dilewati:`, (e as Error).message);
+    }
+  }
+  const hit = identifyFace(descriptor as number[], enrolled);
+  res.json({ hit });
+});
+
+// Admin-only: jumlah wajah terdaftar per anggota (buat dashboard), TANPA
+// pernah mengirim vektor embedding-nya ke client.
+app.get('/api/faces/summary', requireAdmin, (_req, res) => {
+  const rows = db.select().from(faces).all();
+  res.json(rows.map((r) => ({
+    memberId: r.memberId,
+    count: decryptJson<number[][]>(r.descriptors).length,
+    updatedAt: r.updatedAt,
+  })));
 });
 
 app.post('/api/faces', requireAdmin, (req, res) => {
@@ -471,12 +556,13 @@ app.post('/api/faces', requireAdmin, (req, res) => {
     && descriptors.every((d) => Array.isArray(d) && d.length === 128
       && (d as unknown[]).every((x) => typeof x === 'number' && Number.isFinite(x)));
   if (!valid) return void res.status(400).json({ error: 'descriptors invalid (1-3 x 128 angka)' });
+  const enc = encryptJson(descriptors);
   const existing = db.select().from(faces).where(eq(faces.memberId, memberId)).all()[0];
   if (existing) {
-    db.update(faces).set({ descriptors: JSON.stringify(descriptors), updatedAt: Date.now() })
+    db.update(faces).set({ descriptors: enc, updatedAt: Date.now() })
       .where(eq(faces.memberId, memberId)).run();
   } else {
-    db.insert(faces).values({ memberId, descriptors: JSON.stringify(descriptors), updatedAt: Date.now() }).run();
+    db.insert(faces).values({ memberId, descriptors: enc, updatedAt: Date.now() }).run();
   }
   res.json({ ok: true });
 });
@@ -503,6 +589,31 @@ const onDutyAt = (tanggal: string, memberId: string): string | null => {
   return ok ? memberId : null;
 };
 
+// Senin dari minggu yang memuat `tanggal` (YYYY-MM-DD).
+const mondayOf = (tanggal: string): string => {
+  const d = new Date(tanggal + 'T00:00');
+  const dow = d.getDay(); // 0=Minggu
+  const diff = dow === 0 ? -6 : 1 - dow;
+  d.setDate(d.getDate() + diff);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+};
+
+// Jam selesai piket EFEKTIF utk member+tanggal (dipakai gate kirim lapsit).
+// Ikuti jam yang diatur admin: pakai override minggu itu kalau ada (hasil
+// drag-drop tab Mingguan), fallback ke jadwal template dasar.
+const jamSelesaiAt = (tanggal: string, memberId: string): string | null => {
+  const dow = new Date(tanggal + 'T00:00').getDay();
+  if (dow < 1 || dow > 5) return null;
+  const day = DAYS[dow - 1];
+  const week = mondayOf(tanggal);
+  const overrideRow = db.select().from(roster)
+    .where(and(eq(roster.weekStart, week), eq(roster.day, day), eq(roster.memberId, memberId))).all()[0];
+  if (overrideRow) return overrideRow.jamSelesai;
+  const baseRow = db.select().from(roster)
+    .where(and(isNull(roster.weekStart), eq(roster.day, day), eq(roster.memberId, memberId))).all()[0];
+  return baseRow?.jamSelesai ?? null;
+};
+
 app.post('/api/attendance', (req, res) => {
   const { tanggal, memberId } = (req.body ?? {}) as { tanggal: string; memberId: string };
   if (!/^\d{4}-\d{2}-\d{2}$/.test(tanggal ?? '')) return void res.status(400).json({ error: 'tanggal invalid' });
@@ -524,22 +635,32 @@ app.post('/api/attendance', (req, res) => {
   res.json({ ok: true, jam });
 });
 
-// ---- bukti per tugas (1 foto per judul tugas per tanggal, shared) ----
+// ---- bukti per tugas PER ORANG (tiap anggota upload fotonya sendiri) ----
+// Privasi: user biasa hanya bisa lihat foto miliknya sendiri (memberId wajib
+// & dipaksa cocok dgn query). Admin/superadmin (header x-admin-pin valid)
+// boleh lihat foto SIAPA PUN — dipakai di tab Mingguan admin & Superadmin.
 app.get('/api/evidence', (req, res) => {
-  const { date, from, to } = req.query as Record<string, string | undefined>;
+  const { date, from, to, memberId } = req.query as Record<string, string | undefined>;
+  const isAdmin = req.header('x-admin-pin') === ADMIN_PIN;
   let rows = db.select().from(evidence).all();
   if (date) rows = rows.filter((r) => r.tanggal === date);
   if (from && to) rows = rows.filter((r) => r.tanggal >= from && r.tanggal <= to);
-  res.json(rows);
+  if (!isAdmin) {
+    if (!memberId) return void res.status(400).json({ error: 'memberId wajib (atau PIN Admin untuk lihat semua)' });
+    rows = rows.filter((r) => r.memberId === memberId);
+  } else if (memberId) {
+    rows = rows.filter((r) => r.memberId === memberId); // admin tetap boleh filter 1 orang
+  }
+  res.json(rows.map((r) => ({ ...r, file: makeSignedEvidenceUrl(`evidence/${r.file}`) })));
 });
 
-// Pastikan baris checklist tanggal itu ada (clone dari template bila baru).
-const ensureChecks = (tanggal: string) => {
-  let rows = db.select().from(tasks).where(eq(tasks.tanggal, tanggal)).all();
+// Pastikan baris checklist tanggal+member itu ada (clone dari template bila baru).
+const ensureChecks = (tanggal: string, memberId: string) => {
+  let rows = db.select().from(tasks).where(and(eq(tasks.tanggal, tanggal), eq(tasks.memberId, memberId))).all();
   if (rows.length === 0) {
     const tpl = db.select().from(tasks).where(eq(tasks.tanggal, 'template')).all();
-    for (const t of tpl) db.insert(tasks).values({ tanggal, judul: t.judul, done: 0, sort: t.sort }).run();
-    rows = db.select().from(tasks).where(eq(tasks.tanggal, tanggal)).all();
+    for (const t of tpl) db.insert(tasks).values({ tanggal, memberId, judul: t.judul, done: 0, sort: t.sort }).run();
+    rows = db.select().from(tasks).where(and(eq(tasks.tanggal, tanggal), eq(tasks.memberId, memberId))).all();
   }
   return rows.sort((a, b) => a.sort - b.sort);
 };
@@ -556,7 +677,7 @@ app.post('/api/evidence', (req, res) => {
   const onDuty = dayName
     && db.select().from(roster).where(eq(roster.day, dayName)).all().some((r) => r.memberId === memberId);
   if (!onDuty) return void res.status(400).json({ error: `${member.nama} tidak piket di tanggal itu` });
-  const task = ensureChecks(tanggal).find((t) => t.judul === tugas);
+  const task = ensureChecks(tanggal, memberId).find((t) => t.judul === tugas);
   const master = !task
     ? db.select().from(tugasMaster).where(eq(tugasMaster.judul, tugas)).all()[0]
     : null;
@@ -566,25 +687,35 @@ app.post('/api/evidence', (req, res) => {
   const buf = Buffer.from(m[2], 'base64');
   if (buf.length > 5 * 1024 * 1024) return void res.status(400).json({ error: 'foto >5MB' });
   const slug = tugas.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 30) || 'foto';
-  const fname = task ? `${tanggal}_task${task.id}.jpg` : `${tanggal}_${slug}.jpg`;
+  const fname = task ? `${tanggal}_task${task.id}_${memberId}.jpg` : `${tanggal}_${slug}_${memberId}.jpg`;
   const existing = db.select().from(evidence).all()
-    .find((r) => r.tanggal === tanggal && r.tugas === tugas);
+    .find((r) => r.tanggal === tanggal && r.tugas === tugas && r.memberId === memberId);
   if (existing) {
     return void res.status(400).json({ error: 'foto sudah diterima, tidak perlu 2x' });
   }
-  fs.writeFileSync(path.join(UPLOAD_DIR, fname), buf);
-  const file = `/uploads/${fname}`;
+  fs.mkdirSync(path.join(UPLOAD_DIR, 'evidence'), { recursive: true });
+  fs.writeFileSync(path.join(UPLOAD_DIR, 'evidence', fname), buf);
+  const file = fname; // path relatif disimpan di DB — URL akses selalu di-generate ulang (signed, expired)
   db.insert(evidence).values({ tanggal, tugas, memberId, file, createdAt: Date.now() }).run();
   if (task) db.update(tasks).set({ done: 1 }).where(eq(tasks.id, task.id)).run(); // upload = selesai
-  res.json({ ok: true, file });
+  res.json({ ok: true, file: makeSignedEvidenceUrl(`evidence/${fname}`) });
 });
 
-// ---- lapsit akhir piket (wajib 4 foto dulu, stempel waktu+koordinat) ----
+// ---- lapsit akhir piket PER ORANG (wajib foto SENDIRI lengkap dulu) ----
+// Privasi: user biasa hanya lihat lapsit miliknya sendiri; admin (x-admin-pin)
+// boleh lihat semua — sama seperti evidence.
 app.get('/api/lapsit', (req, res) => {
-  const { date, from, to } = req.query as Record<string, string | undefined>;
+  const { date, from, to, memberId } = req.query as Record<string, string | undefined>;
+  const isAdmin = req.header('x-admin-pin') === ADMIN_PIN;
   let rows = db.select().from(lapsit).all();
   if (date) rows = rows.filter((r) => r.tanggal === date);
   if (from && to) rows = rows.filter((r) => r.tanggal >= from && r.tanggal <= to);
+  if (!isAdmin) {
+    if (!memberId) return void res.status(400).json({ error: 'memberId wajib (atau PIN Admin untuk lihat semua)' });
+    rows = rows.filter((r) => r.memberId === memberId);
+  } else if (memberId) {
+    rows = rows.filter((r) => r.memberId === memberId);
+  }
   res.json(rows.sort((a, b) => b.createdAt - a.createdAt));
 });
 
@@ -597,15 +728,34 @@ app.post('/api/lapsit', (req, res) => {
   const member = db.select().from(members).where(eq(members.id, memberId)).all()[0];
   if (!member) return void res.status(400).json({ error: 'anggota invalid' });
   if (!onDutyAt(tanggal, memberId)) return void res.status(400).json({ error: `${member.nama} tidak piket di tanggal itu` });
+  // Lapsit cuma boleh dikirim maks 30 menit SEBELUM jam selesai piket
+  // (jam diatur admin di jadwal, ikut override minggu berjalan kalau ada).
+  // Cek hanya berlaku utk tanggal HARI INI — laporan tanggal lampau (yg
+  // realistis cuma dari sisi admin melihat histori) tidak perlu digate.
+  if (tanggal === todayLocal()) {
+    const selesai = jamSelesaiAt(tanggal, memberId);
+    if (selesai) {
+      const [hh, mm] = selesai.split('.').map(Number);
+      const batas = new Date();
+      batas.setHours(hh, mm - 30, 0, 0);
+      if (new Date() < batas) {
+        return void res.status(400).json({
+          error: `lapsit baru bisa dikirim mulai 30 menit sebelum piket selesai (${selesai})`,
+        });
+      }
+    }
+  }
   const note = (catatan ?? '').trim().replace(/\s+/g, ' ').slice(0, 500);
   if (note.length < 5) return void res.status(400).json({ error: 'catatan minimal 5 huruf' });
   const need = db.select().from(tasks).where(eq(tasks.tanggal, 'template')).all().length;
+  // Syarat: foto WAJIB milik anggota INI sendiri lengkap — bukan gabungan tim.
   const got = new Set(
-    db.select().from(evidence).where(eq(evidence.tanggal, tanggal)).all().map((e) => e.tugas),
+    db.select().from(evidence).where(and(eq(evidence.tanggal, tanggal), eq(evidence.memberId, memberId))).all()
+      .map((e) => e.tugas),
   ).size;
-  if (got < need) return void res.status(400).json({ error: `lengkapi ${need} foto bukti dulu (baru ${got})` });
-  const already = db.select().from(lapsit).where(eq(lapsit.tanggal, tanggal)).all()[0];
-  if (already) return void res.status(400).json({ error: 'lapsit hari ini sudah dikirim' });
+  if (got < need) return void res.status(400).json({ error: `lengkapi ${need} foto bukti kamu dulu (baru ${got})` });
+  const already = db.select().from(lapsit).where(and(eq(lapsit.tanggal, tanggal), eq(lapsit.memberId, memberId))).all()[0];
+  if (already) return void res.status(400).json({ error: 'lapsit kamu hari ini sudah dikirim' });
   const row = db.insert(lapsit).values({
     tanggal, memberId, catatan: note,
     lat: lat ?? null, lng: lng ?? null,
@@ -615,7 +765,101 @@ app.post('/api/lapsit', (req, res) => {
   res.json({ ok: true, id: Number(row.lastInsertRowid) });
 });
 
-// ================= PENILAIAN PER ORANG =================
+// ---- Rincian Tugas (Opsional): checklist 34 item, PER ORANG ----
+// Total item HARUS sinkron dgn src/breakdown.ts (BREAKDOWN) di client.
+const BREAKDOWN_TOTAL = 34;
+
+app.get('/api/breakdown', (req, res) => {
+  const { date, memberId } = req.query as Record<string, string | undefined>;
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date ?? '') || !memberId) {
+    return void res.status(400).json({ error: 'date & memberId wajib' });
+  }
+  const rows = db.select().from(breakdown)
+    .where(and(eq(breakdown.tanggal, date), eq(breakdown.memberId, memberId))).all();
+  res.json({ done: rows.map((r) => r.itemKey) });
+});
+
+app.post('/api/breakdown', (req, res) => {
+  const { tanggal, memberId, itemKey, done } = (req.body ?? {}) as {
+    tanggal: string; memberId: string; itemKey: string; done: boolean;
+  };
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(tanggal ?? '')) return void res.status(400).json({ error: 'tanggal invalid' });
+  const member = db.select({ id: members.id }).from(members).where(eq(members.id, memberId)).all()[0];
+  if (!member) return void res.status(400).json({ error: 'anggota invalid' });
+  if (!/^\d+:\d+$/.test(itemKey ?? '')) return void res.status(400).json({ error: 'itemKey invalid' });
+  const existing = db.select().from(breakdown)
+    .where(and(eq(breakdown.tanggal, tanggal), eq(breakdown.memberId, memberId), eq(breakdown.itemKey, itemKey))).all()[0];
+  if (done) {
+    if (!existing) db.insert(breakdown).values({ tanggal, memberId, itemKey, doneAt: Date.now() }).run();
+  } else if (existing) {
+    db.delete(breakdown).where(eq(breakdown.id, existing.id)).run();
+  }
+  res.json({ ok: true });
+});
+
+// ---- Nilai OTOMATIS real-time: 4 foto wajib (60%) + checklist opsional
+// 34 item (30%) + lapsit terkirim (10%). TIDAK ADA verifikasi manual —
+// begitu syarat terpenuhi, nilai langsung terhitung & masuk leaderboard.
+const nilaiOtomatis = (tanggal: string, memberId: string): number => {
+  const needFoto = db.select().from(tasks).where(eq(tasks.tanggal, 'template')).all().length || 1;
+  const gotFoto = new Set(
+    db.select().from(evidence).where(and(eq(evidence.tanggal, tanggal), eq(evidence.memberId, memberId))).all()
+      .map((e) => e.tugas),
+  ).size;
+  const gotBd = db.select().from(breakdown)
+    .where(and(eq(breakdown.tanggal, tanggal), eq(breakdown.memberId, memberId))).all().length;
+  const gotLapsit = db.select().from(lapsit)
+    .where(and(eq(lapsit.tanggal, tanggal), eq(lapsit.memberId, memberId))).all().length > 0;
+  const fotoScore = Math.min(1, gotFoto / needFoto) * 60;
+  const bdScore = Math.min(1, gotBd / BREAKDOWN_TOTAL) * 30;
+  const lapsitScore = gotLapsit ? 10 : 0;
+  return Math.round((fotoScore + bdScore + lapsitScore) * 100) / 100;
+};
+
+// Rekap leaderboard real-time (ganti /api/nilai/rekap lama yg butuh verifikasi
+// manual ketua/wakil — server yg gak pernah dipakai UI-nya). Dihitung dari
+// SEMUA member yg piket di rentang tanggal, bukan cuma yg punya assessment.
+app.get('/api/nilai/leaderboard', (req, res) => {
+  const { from, to } = req.query as Record<string, string | undefined>;
+  const f = from && /^\d{4}-\d{2}-\d{2}$/.test(from) ? from : todayLocal();
+  const t = to && /^\d{4}-\d{2}-\d{2}$/.test(to) ? to : todayLocal();
+  const allMembers = db.select().from(members).all();
+  const by: Record<string, { nama: string; vals: number[] }> = {};
+  let d = new Date(f + 'T00:00');
+  const end = new Date(t + 'T00:00');
+  while (d <= end) {
+    const tanggal = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+    const dow = d.getDay();
+    if (dow >= 1 && dow <= 5) {
+      const day = DAYS[dow - 1];
+      const crew = new Set(db.select().from(roster).where(eq(roster.day, day)).all().map((r) => r.memberId));
+      for (const mid of crew) {
+        const m = allMembers.find((x) => x.id === mid);
+        const e = (by[mid] ??= { nama: m?.nama ?? mid, vals: [] });
+        e.vals.push(nilaiOtomatis(tanggal, mid));
+      }
+    }
+    d.setDate(d.getDate() + 1);
+  }
+  const rows = Object.entries(by)
+    .map(([memberId, v]) => ({
+      memberId, nama: v.nama, n: v.vals.length,
+      rata2: v.vals.length ? Math.round((v.vals.reduce((a, n) => a + n, 0) / v.vals.length) * 100) / 100 : null,
+    }))
+    .sort((a, b) => (b.rata2 ?? -1) - (a.rata2 ?? -1));
+  res.json({ rows });
+});
+
+// Nilai hari ini utk 1 member (dipakai kartu "Nilai Piketmu" di HP).
+app.get('/api/nilai/today', (req, res) => {
+  const { date, memberId } = req.query as Record<string, string | undefined>;
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date ?? '') || !memberId) {
+    return void res.status(400).json({ error: 'date & memberId wajib' });
+  }
+  res.json({ nilai: nilaiOtomatis(date, memberId) });
+});
+
+// ================= PENILAIAN PER ORANG (LEGACY — belum ada UI, disimpan cadangan) =================
 const getSetting = (key: string): string | null =>
   db.select().from(settings).where(eq(settings.key, key)).all()[0]?.value ?? null;
 
@@ -689,7 +933,7 @@ app.post('/api/nilai/items', (req, res) => {
       return void res.status(400).json({ error: `N/A hanya untuk Kondisional (no ${row.no})` });
     }
     if (it.status === 'selesai' && row.fotoWajib) {
-      const ada = db.select().from(evidence).where(eq(evidence.tanggal, a.tanggal)).all()
+      const ada = db.select().from(evidence).where(and(eq(evidence.tanggal, a.tanggal), eq(evidence.memberId, a.memberId))).all()
         .some((e) => e.tugas === row.judul);
       if (!ada) return void res.status(400).json({ error: `wajib foto: ${row.judul}` });
     }
@@ -721,7 +965,7 @@ app.post('/api/nilai/submit', (req, res) => {
       return void res.status(400).json({ error: `N/A hanya untuk Kondisional (no ${row.no})` });
     }
     if (row.status === 'selesai' && row.fotoWajib) {
-      const ada = db.select().from(evidence).where(eq(evidence.tanggal, a.tanggal)).all()
+      const ada = db.select().from(evidence).where(and(eq(evidence.tanggal, a.tanggal), eq(evidence.memberId, a.memberId))).all()
         .some((e) => e.tugas === row.judul);
       if (!ada) return void res.status(400).json({ error: `wajib foto: ${row.judul}` });
     }

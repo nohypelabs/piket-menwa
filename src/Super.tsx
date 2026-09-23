@@ -1,10 +1,10 @@
 import { useEffect, useState } from 'react';
 import { AnimatePresence, motion } from 'framer-motion';
 import {
-  deleteMember, isOnline, loadAttendance, loadChecks, loadEvidence, loadFaces,
+  deleteMember, isOnline, loadAttendance, loadEvidence, loadFaceSummary,
   loadLapsit, loadState, superGet, verifySuper,
-  type AppState, type AttRow, type EvidenceRow, type FaceRow, type FeedItem,
-  type LapsitRow, type Overview, type SwapRow, type TaskRow,
+  type AppState, type AttRow, type EvidenceRow, type FaceSummary, type FeedItem,
+  type LapsitRow, type Overview, type SwapRow,
 } from './api';
 import { dateStr } from './piket';
 
@@ -18,11 +18,10 @@ export default function SuperView({ onExit }: { onExit: () => void }) {
   const [state, setState] = useState<AppState | null>(null);
   const [ov, setOv] = useState<Overview | null>(null);
   const [feed, setFeed] = useState<FeedItem[]>([]);
-  const [faces, setFaces] = useState<FaceRow[]>([]);
+  const [faces, setFaces] = useState<FaceSummary[]>([]);
   const [att, setAtt] = useState<AttRow[]>([]);
   const [ev, setEv] = useState<EvidenceRow[]>([]);
   const [laps, setLaps] = useState<LapsitRow[]>([]);
-  const [checks, setChecks] = useState<TaskRow[]>([]);
   const [swaps, setSwaps] = useState<SwapRow[]>([]);
   const [preview, setPreview] = useState<string | null>(null);
   const [lbFrom, setLbFrom] = useState(() => dateStr(0).slice(0, 8) + '01');
@@ -32,7 +31,7 @@ export default function SuperView({ onExit }: { onExit: () => void }) {
   const reloadMembers = async () => {
     const s = await loadState();
     setState(s);
-    setFaces(await loadFaces());
+    setFaces(await loadFaceSummary());
   };
 
   const hapus = async (id: string, nama_: string) => {
@@ -56,7 +55,7 @@ export default function SuperView({ onExit }: { onExit: () => void }) {
       if (s) setSwaps(s.swaps);
       setOv(await superGet<Overview>('/api/super/overview'));
       setFeed((await superGet<FeedItem[]>('/api/super/feed?limit=50')) ?? []);
-      setFaces(await loadFaces());
+      setFaces(await loadFaceSummary());
     })();
   }, [ok]);
 
@@ -66,36 +65,17 @@ export default function SuperView({ onExit }: { onExit: () => void }) {
       setAtt((await loadAttendance(date, date)) ?? []);
       setEv((await loadEvidence(date, date)) ?? []);
       setLaps((await loadLapsit(date, date)) ?? []);
-      const c = await loadChecks(date);
-      if (c) setChecks(c);
     })();
   }, [ok, date]);
 
   useEffect(() => {
     if (!ok) return;
     (async () => {
-      const s = await loadState();
-      const mems = s?.members ?? [];
-      const r = await superGet<{ rows: { memberId: string; nilai: number | null }[] }>(
-        `/api/nilai/rekap?from=${lbFrom}&to=${lbTo}`,
+      const r = await superGet<{ rows: { memberId: string; nama: string; n: number; rata2: number | null }[] }>(
+        `/api/nilai/leaderboard?from=${lbFrom}&to=${lbTo}`,
       );
       if (!r) return;
-      const by: Record<string, { nama: string; vals: number[] }> = {};
-      for (const row of r.rows) {
-        const m = mems.find((x) => x.id === row.memberId);
-        const e = (by[row.memberId] ??= { nama: m?.nama ?? row.memberId, vals: [] });
-        if (typeof row.nilai === 'number') e.vals.push(row.nilai);
-      }
-      setLb(
-        Object.entries(by)
-          .map(([memberId, v]) => ({
-            memberId,
-            nama: v.nama,
-            n: v.vals.length,
-            rata2: v.vals.length ? Math.round((v.vals.reduce((a, n) => a + n, 0) / v.vals.length) * 100) / 100 : null,
-          }))
-          .sort((a, b) => (b.rata2 ?? -1) - (a.rata2 ?? -1)),
-      );
+      setLb(r.rows.sort((a, b) => (b.rata2 ?? -1) - (a.rata2 ?? -1)));
     })();
   }, [ok, lbFrom, lbTo]);
 
@@ -186,7 +166,7 @@ export default function SuperView({ onExit }: { onExit: () => void }) {
               <td>{m.foto ? <img className="ava" src={m.foto} alt="" /> : <i className="pdot" style={{ background: m.warna }} />}</td>
               <td>{m.nama}{m.angkatan ? ` · ${m.angkatan}` : ''}</td>
               <td>{m.jabatan ?? '—'}</td>
-              <td>{(faces.find((f) => f.memberId === m.id)?.descriptors.length ?? 0) || '—'}</td>
+              <td>{(faces.find((f) => f.memberId === m.id)?.count ?? 0) || '—'}</td>
               <td>{isOnline(m) ? '🟢 online' : '⚫'}</td>
               <td><button className="supdel" onClick={() => void hapus(m.id, m.nama)}>hapus</button></td>
             </tr>
@@ -201,7 +181,7 @@ export default function SuperView({ onExit }: { onExit: () => void }) {
       {att.map((a) => (
         <p key={a.id} className="hist">{nama(a.memberId)} — hadir {a.jam}</p>
       ))}
-      <h3>Bukti foto ({ev.length}/{checks.length} tugas)</h3>
+      <h3>Bukti foto ({ev.length}/{state?.templateLen ?? 0} tugas)</h3>
       <div className="evthumbs">
         {ev.map((e) => (
           <img key={e.id} src={e.file} alt={e.tugas} title={`${e.tugas} — ${nama(e.memberId)}`} onClick={() => setPreview(e.file)} />
@@ -241,7 +221,10 @@ export default function SuperView({ onExit }: { onExit: () => void }) {
               exit={{ opacity: 0, scale: 0.96, y: 10 }}
               transition={{ duration: 0.22, ease: 'easeOut' }}
             >
-              <img src={preview} alt="bukti" />
+              <div className="wmwrap">
+                <img src={preview} alt="bukti" />
+                <span className="wm">Admin • {new Date().toLocaleString('id-ID')}</span>
+              </div>
               <button className="primary" onClick={() => setPreview(null)}>Tutup</button>
             </motion.div>
           </motion.div>

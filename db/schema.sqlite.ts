@@ -30,11 +30,14 @@ export const roster = sqliteTable('roster', {
   weekStart: text('week_start'),
 });
 
-// Checklist per tanggal. Baris bertanggal 'template' = master tugas harian,
-// di-clone ke tanggal nyata saat pertama dibaca.
+// Checklist per tanggal PER ORANG. Baris bertanggal 'template' (memberId
+// NULL) = master tugas harian, di-clone per anggota piket saat pertama kali
+// checklist tanggal itu dibaca oleh member tsb (bukan shared 1 baris untuk
+// semua orang yang piket hari itu).
 export const tasks = sqliteTable('tasks', {
   id: integer('id').primaryKey({ autoIncrement: true }),
   tanggal: text('tanggal').notNull(), // YYYY-MM-DD atau 'template'
+  memberId: text('member_id').references(() => members.id), // NULL = baris template
   judul: text('judul').notNull(),
   done: integer('done').notNull().default(0),
   sort: integer('sort').notNull().default(0),
@@ -54,7 +57,9 @@ export const swaps = sqliteTable('swaps', {  id: text('id').primaryKey(),
   createdAt: integer('created_at').notNull(),
 });
 
-// Bukti per tugas: 1 foto per judul tugas per tanggal (shared, siapa pun boleh upload).
+// Bukti per tugas PER ORANG: tiap anggota yang piket upload fotonya
+// SENDIRI-SENDIRI (bukan shared 1 foto untuk semua yang piket hari itu).
+// Unique effektif per (tanggal, tugas, memberId) — divalidasi di server.
 // File di disk ./uploads (nanti: Supabase Storage), kolom file = path/URL.
 export const evidence = sqliteTable('evidence', {
   id: integer('id').primaryKey({ autoIncrement: true }),
@@ -81,6 +86,23 @@ export const lapsit = sqliteTable('lapsit', {
   createdAt: integer('created_at').notNull(),
 });
 
+// Rincian Tugas (Opsional) — checklist 34 item dari BREAKDOWN (src/breakdown.ts),
+// PER ORANG. Dulu cuma tersimpan di localStorage HP (server tidak pernah
+// tahu), jadi tidak pernah ikut ke perhitungan nilai. Sekarang disinkron ke
+// server: 1 baris per item yang SUDAH dicentang (key = "groupIndex:itemIndex").
+export const breakdown = sqliteTable(
+  'breakdown',
+  {
+    id: integer('id').primaryKey({ autoIncrement: true }),
+    tanggal: text('tanggal').notNull(),
+    memberId: text('member_id')
+      .notNull()
+      .references(() => members.id),
+    itemKey: text('item_key').notNull(), // "gi:ii"
+    doneAt: integer('done_at').notNull(),
+  },
+);
+
 // Langganan push per perangkat (1 anggota boleh banyak device).
 export const pushSubs = sqliteTable('push_subs', {
   endpoint: text('endpoint').primaryKey(),
@@ -90,13 +112,15 @@ export const pushSubs = sqliteTable('push_subs', {
   sub: text('sub').notNull(), // JSON subscription
   createdAt: integer('created_at').notNull(),
 });
-// Wajah terdaftar: 1 baris per anggota, descriptors = JSON number[][] (maks 3).
-// Cocok di HP via face-api.js lokal — biometrik tidak keluar perangkat selain vektor ini.
+// Wajah terdaftar: 1 baris per anggota, descriptors = CIPHERTEXT (AES-256-GCM,
+// lihat db/crypto.ts) dari JSON number[][] (maks 3 vektor 128-dim). Tidak ada
+// foto wajah di sini — cuma embedding terenkripsi, matching dilakukan di
+// server (client tidak pernah menerima descriptor mentah siapa pun).
 export const faces = sqliteTable('faces', {
   memberId: text('member_id')
     .primaryKey()
     .references(() => members.id),
-  descriptors: text('descriptors').notNull(),
+  descriptors: text('descriptors').notNull(), // ciphertext base64
   updatedAt: integer('updated_at').notNull(),
 });
 

@@ -11,7 +11,7 @@
   "scripts": {
     "dev": "vite",
     "dev:all": "pnpm seed & pnpm server & vite",
-    "server": "node server/index.ts",
+    "server": "node --env-file-if-exists=.env server/index.ts",
     "seed": "node server/seed.ts",
     "build": "tsc -b && vite build",
     "lint": "oxlint",

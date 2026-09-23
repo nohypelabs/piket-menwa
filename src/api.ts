@@ -24,6 +24,20 @@ async function get<T>(url: string): Promise<T | null> {
   }
 }
 
+// Sama seperti get(), tapi ikut kirim PIN Admin (bila ada) — dipakai endpoint
+// yang server-nya bedakan privasi user-biasa vs admin (evidence, lapsit).
+async function getAuthed<T>(url: string): Promise<T | null> {
+  try {
+    const r = await fetch(url, {
+      headers: getPin() ? { 'x-admin-pin': getPin() as string } : {},
+    });
+    if (!r.ok) throw new Error(String(r.status));
+    return (await r.json()) as T;
+  } catch {
+    return null;
+  }
+}
+
 async function post(url: string, body?: unknown): Promise<boolean> {
   try {
     const r = await fetch(url, {
@@ -37,6 +51,25 @@ async function post(url: string, body?: unknown): Promise<boolean> {
     return r.ok;
   } catch {
     return false;
+  }
+}
+
+// Sama seperti post(), tapi parse & kembalikan body JSON hasilnya (dipakai
+// endpoint yang balikin data, misal hasil match wajah).
+async function postJson<T>(url: string, body?: unknown): Promise<T | null> {
+  try {
+    const r = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(getPin() ? { 'x-admin-pin': getPin() as string } : {}),
+      },
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    if (!r.ok) return null;
+    return (await r.json()) as T;
+  } catch {
+    return null;
   }
 }
 
@@ -150,12 +183,13 @@ export interface AppState {
   schedule: Record<DayKey, string[]>;
   jam: Record<DayKey, string>; // "09.00–15.00"
   swaps: SwapRow[];
+  templateLen: number; // jumlah tugas master (dipakai buat hitung X/Y bukti)
 }
 
 export async function loadState(): Promise<AppState> {
   const s = await get<{
     members: Member[]; roster: RosterRow[];
-    swaps: SwapRow[];
+    swaps: SwapRow[]; template: TaskRow[];
   }>('/api/state');
   if (s) {
     const schedule = { ...DEFAULT_SCHEDULE } as Record<DayKey, string[]>;
@@ -166,7 +200,7 @@ export async function loadState(): Promise<AppState> {
       jam[r.day] = `${r.jamMulai}–${r.jamSelesai}`;
     }
     save('piket-members', s.members);
-    return { fromApi: true, members: s.members, schedule, jam, swaps: s.swaps as SwapRow[] };
+    return { fromApi: true, members: s.members, schedule, jam, swaps: s.swaps as SwapRow[], templateLen: s.template.length };
   }
   // offline fallback (anggota = cache terakhir, bisa kosong)
   const schedule = load('piket-schedule', DEFAULT_SCHEDULE);
@@ -175,12 +209,12 @@ export async function loadState(): Promise<AppState> {
     fromApi: false,
     members: load<Member[]>('piket-members', []),
     schedule, jam: Object.fromEntries(Object.keys(schedule).map((d) => [d, '09.00–15.00'])) as Record<DayKey, string>,
-    swaps,
+    swaps, templateLen: DEFAULT_TASKS.length,
   };
 }
 
-export async function loadChecks(date = dateStr(0)): Promise<TaskRow[] | null> {
-  const rows = await get<TaskRow[]>(`/api/checks?date=${date}`);
+export async function loadChecks(date: string, memberId: string): Promise<TaskRow[] | null> {
+  const rows = await get<TaskRow[]>(`/api/checks?date=${date}&memberId=${encodeURIComponent(memberId)}`);
   return rows;
 }
 
@@ -191,8 +225,8 @@ export function localChecks(date = dateStr(0)): TaskRow[] {
   }));
 }
 
-export async function toggleCheckRemote(date: string, judul: string): Promise<boolean> {
-  return post('/api/checks/toggle', { date, judul });
+export async function toggleCheckRemote(date: string, memberId: string, judul: string): Promise<boolean> {
+  return post('/api/checks/toggle', { date, memberId, judul });
 }
 
 export function toggleCheckLocal(date: string, judul: string) {
@@ -298,19 +332,23 @@ export async function clearWeekRosterRemote(weekStart: string): Promise<boolean>
 }
 
 // ---- wajah & absen ----
-export interface FaceRow {
-  memberId: string;
-  descriptors: number[][];
-  updatedAt: number;
+// FaceRow lama (raw embedding) TIDAK LAGI diambil di client sama sekali.
+// Dashboard admin cukup butuh RINGKASAN (berapa vektor terdaftar per orang),
+// bukan vektornya — dipakai Super.tsx.
+export interface FaceSummary { memberId: string; count: number; updatedAt: number }
+
+export async function loadFaceSummary(): Promise<FaceSummary[]> {
+  return (await getAuthed<FaceSummary[]>('/api/faces/summary')) ?? [];
 }
 
-export async function loadFaces(): Promise<FaceRow[]> {
-  const rows = await get<{ memberId: string; descriptors: string; updatedAt: number }[]>('/api/faces');
-  return (rows ?? []).map((r) => ({
-    memberId: r.memberId,
-    descriptors: JSON.parse(r.descriptors) as number[][],
-    updatedAt: r.updatedAt,
-  }));
+// Cocokkan 1 descriptor (hasil scan kamera device sendiri) ke server —
+// server yang simpan & bandingkan SEMUA embedding, client cuma terima hasil
+// {memberId, ambiguous}, tidak pernah menerima vektor member lain.
+export async function matchFace(descriptor: number[]): Promise<{ memberId: string; ambiguous?: boolean } | null> {
+  const r = await postJson<{ hit: { memberId: string; distance: number; ambiguous?: boolean } | null }>(
+    '/api/faces/match', { descriptor },
+  );
+  return r?.hit ?? null;
 }
 
 export async function saveFaces(
@@ -357,19 +395,38 @@ export const isOnline = (m: { lastSeen: number | null }) =>
   !!m.lastSeen && Date.now() - m.lastSeen < 90000;
 
 // ---- pendaftaran mandiri (wajah + nama + angkatan + jabatan + PIN), tanpa login ----
+// CATATAN PRIVASI: TIDAK ADA parameter foto lagi — cuma embedding wajah yang
+// dikirim (server enkripsi & simpan sebagai vektor, bukan gambar). Kalau mau
+// avatar profil, upload TERPISAH lewat setProfilePhoto() setelah login.
 export async function registerMember(
-  nama: string, angkatan: string, jabatan: string, pin: string, descriptors: number[][], foto: string,
+  nama: string, angkatan: string, jabatan: string, pin: string, descriptors: number[][],
 ): Promise<{ ok: boolean; memberId?: string; error?: string }> {
   try {
     const r = await fetch('/api/register', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ nama, angkatan, jabatan, pin, descriptors, foto }),
+      body: JSON.stringify({ nama, angkatan, jabatan, pin, descriptors }),
     });
     const j = (await r.json()) as { memberId?: string; error?: string };
     return r.ok ? { ok: true, memberId: j.memberId } : { ok: false, error: j.error ?? 'gagal' };
   } catch {
     return { ok: false, error: 'offline — butuh online untuk daftar' };
+  }
+}
+
+// Foto profil OPSIONAL (avatar tampilan) — beda total dari data biometrik
+// wajah, hanya foto yang dipilih sendiri oleh member. dataUrl='' = hapus avatar.
+export async function setProfilePhoto(memberId: string, dataUrl: string): Promise<{ ok: boolean; foto: string | null; error?: string }> {
+  try {
+    const r = await fetch(`/api/members/${encodeURIComponent(memberId)}/foto`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ foto: dataUrl }),
+    });
+    const j = (await r.json()) as { foto?: string | null; error?: string };
+    return r.ok ? { ok: true, foto: j.foto ?? null } : { ok: false, foto: null, error: j.error ?? 'gagal' };
+  } catch {
+    return { ok: false, foto: null, error: 'offline' };
   }
 }
 
@@ -420,8 +477,9 @@ export interface EvidenceRow {
   file: string; createdAt: number;
 }
 
-export async function loadEvidence(from: string, to: string): Promise<EvidenceRow[] | null> {
-  return get<EvidenceRow[]>(`/api/evidence?from=${from}&to=${to}`);
+export async function loadEvidence(from: string, to: string, memberId?: string): Promise<EvidenceRow[] | null> {
+  const q = memberId ? `&memberId=${encodeURIComponent(memberId)}` : '';
+  return getAuthed<EvidenceRow[]>(`/api/evidence?from=${from}&to=${to}${q}`);
 }
 
 export async function uploadEvidence(
@@ -446,8 +504,9 @@ export interface LapsitRow {
   lat: string | null; lng: string | null; acc: number | null; createdAt: number;
 }
 
-export async function loadLapsit(from: string, to: string): Promise<LapsitRow[] | null> {
-  return get<LapsitRow[]>(`/api/lapsit?from=${from}&to=${to}`);
+export async function loadLapsit(from: string, to: string, memberId?: string): Promise<LapsitRow[] | null> {
+  const q = memberId ? `&memberId=${encodeURIComponent(memberId)}` : '';
+  return getAuthed<LapsitRow[]>(`/api/lapsit?from=${from}&to=${to}${q}`);
 }
 
 export async function submitLapsit(
@@ -469,6 +528,37 @@ export async function submitLapsit(
   } catch {
     return { ok: false, error: 'offline — butuh online untuk kirim lapsit' };
   }
+}
+
+// ---- Rincian Tugas (Opsional): checklist disinkron ke server, per orang ----
+export async function loadBreakdown(date: string, memberId: string): Promise<string[]> {
+  const r = await getAuthed<{ done: string[] }>(`/api/breakdown?date=${date}&memberId=${encodeURIComponent(memberId)}`);
+  return r?.done ?? [];
+}
+
+export async function toggleBreakdown(tanggal: string, memberId: string, itemKey: string, done: boolean): Promise<boolean> {
+  try {
+    const r = await fetch('/api/breakdown', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ tanggal, memberId, itemKey, done }),
+    });
+    return r.ok;
+  } catch {
+    return false;
+  }
+}
+
+// Nilai piket hari ini (otomatis: foto wajib + checklist opsional + lapsit).
+export async function loadNilaiToday(date: string, memberId: string): Promise<number | null> {
+  const r = await getAuthed<{ nilai: number }>(`/api/nilai/today?date=${date}&memberId=${encodeURIComponent(memberId)}`);
+  return r?.nilai ?? null;
+}
+
+export interface LeaderboardRow { memberId: string; nama: string; n: number; rata2: number | null }
+export async function loadLeaderboard(from: string, to: string): Promise<LeaderboardRow[]> {
+  const r = await getAuthed<{ rows: LeaderboardRow[] }>(`/api/nilai/leaderboard?from=${from}&to=${to}`);
+  return r?.rows ?? [];
 }
 
 // Kompres foto dari kamera sebelum kirim (hemat kuota & disk).

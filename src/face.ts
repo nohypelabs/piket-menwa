@@ -62,21 +62,12 @@ export async function descriptorFromVideo(video: HTMLVideoElement): Promise<numb
   return Array.from(det.descriptor as Float32Array);
 }
 
-export interface Enrolled {
-  memberId: string;
-  descriptors: number[][];
-}
+// Matching wajah SEKARANG dilakukan di server (lihat db/face_match.ts +
+// endpoint POST /api/faces/match) — client tidak pernah menyimpan/membanding
+// embedding member lain. Fungsi identify()/dist() versi client DIHAPUS
+// sengaja supaya tidak ada jalur pintas yang menggoda dipakai lagi.
 
-export const dist = (a: number[], b: number[]): number => {
-  let s = 0;
-  for (let i = 0; i < a.length; i++) {
-    const d = a[i] - b[i];
-    s += d * d;
-  }
-  return Math.sqrt(s);
-};
-
-// Foto JPEG dari 1 frame video (untuk foto referensi pendaftaran).
+// ---- Umpan suara (Web Audio, tanpa file): nada ala HUD sci-fi ----
 export function photoFromVideo(video: HTMLVideoElement, maxDim = 640, quality = 0.8): string | null {  try {
     if (!video.videoWidth) return null;
     const scale = Math.min(1, maxDim / Math.max(video.videoWidth, video.videoHeight));
@@ -115,6 +106,15 @@ export async function yawFromVideo(video: HTMLVideoElement): Promise<YawSample |
   return { yaw: (noseTip.x - ec.x) / w, faceRatio: w / video.videoWidth };
 }
 // tanpa simpan video. Fallback: kembalikan apa adanya bila < k.
+const dist = (a: number[], b: number[]): number => {
+  let s = 0;
+  for (let i = 0; i < a.length; i++) {
+    const d = a[i] - b[i];
+    s += d * d;
+  }
+  return Math.sqrt(s);
+};
+
 export function selectDiverse(samples: number[][], k = 3): number[][] {
   if (samples.length <= k) return samples;
   const picked: number[][] = [samples[0]];
@@ -135,22 +135,11 @@ export function selectDiverse(samples: number[][], k = 3): number[][] {
   return picked;
 }
 
-// Cocokkan 1 wajah ke daftar terdaftar. threshold 0.55 (umum 0.5–0.6).
-export function identify(
-  sample: number[],
-  enrolled: Enrolled[],
-  threshold = 0.55,
-): { memberId: string; distance: number } | null {
-  let best: { memberId: string; distance: number } | null = null;
-  for (const e of enrolled) {
-    for (const d of e.descriptors) {
-      if (d.length !== sample.length) continue;
-      const x = dist(sample, d);
-      if (!best || x < best.distance) best = { memberId: e.memberId, distance: x };
-    }
-  }
-  return best && best.distance <= threshold ? best : null;
-}
+// Matching wajah SEKARANG dilakukan di server (lihat db/face_match.ts +
+// endpoint POST /api/faces/match) — client tidak pernah menyimpan/membanding
+// embedding member lain. Fungsi identify() versi client DIHAPUS sengaja
+// supaya tidak ada jalur pintas yang menggoda dipakai lagi (dulu di sini,
+// dipindah ke server persis sama threshold/margin-nya).
 
 // ---- Umpan suara (Web Audio, tanpa file): nada ala HUD sci-fi ----
 let audioCtx: AudioContext | null = null;

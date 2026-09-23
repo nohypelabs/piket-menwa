@@ -31,6 +31,7 @@ export const roster = pgTable('roster', {
 export const tasks = pgTable('tasks', {
   id: integer('id').primaryKey().generatedAlwaysAsIdentity(),
   tanggal: text('tanggal').notNull(),
+  memberId: text('member_id').references(() => members.id), // NULL = baris template
   judul: text('judul').notNull(),
   done: integer('done').notNull().default(0),
   sort: integer('sort').notNull().default(0),
@@ -75,6 +76,17 @@ export const lapsit = pgTable('lapsit', {
   lng: text('lng'),
   acc: integer('acc'),
   createdAt: integer('created_at').notNull(),
+});
+
+// Rincian Tugas (Opsional) — checklist 34 item, PER ORANG (lihat schema.sqlite.ts).
+export const breakdown = pgTable('breakdown', {
+  id: integer('id').primaryKey().generatedAlwaysAsIdentity(),
+  tanggal: text('tanggal').notNull(),
+  memberId: text('member_id')
+    .notNull()
+    .references(() => members.id),
+  itemKey: text('item_key').notNull(),
+  doneAt: integer('done_at').notNull(),
 });
 
 export const pushSubs = pgTable('push_subs', {

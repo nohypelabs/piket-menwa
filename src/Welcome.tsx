@@ -188,6 +188,12 @@ export function WelcomePage({ onTap, onRegister }: { onTap: () => void; onRegist
           onPointerLeave={cancel}
           onContextMenu={(e) => e.preventDefault()}
         >
+          {!holding && (
+            <>
+              <span className="fpping" style={{ animationDelay: '0s' }} />
+              <span className="fpping" style={{ animationDelay: '1s' }} />
+            </>
+          )}
           <svg className="ring" viewBox="0 0 100 100">
             <circle cx="50" cy="50" r={R} className="track" />
             <motion.circle
@@ -232,6 +238,14 @@ export function WelcomePage({ onTap, onRegister }: { onTap: () => void; onRegist
         transition={{ duration: 0.35, delay: 0.32 }}
       >
         Belum punya akun? <button className="wlink" onClick={onRegister}>Daftar</button>
+      </motion.p>
+      <motion.p
+        className="wsecure"
+        initial={{ opacity: 0 }}
+        animate={{ opacity: 1 }}
+        transition={{ duration: 0.35, delay: 0.4 }}
+      >
+        Wajah Anda tidak tersimpan dan langsung terenkripsi AES-256-GCM oleh sistem.
       </motion.p>
     </motion.div>
   );

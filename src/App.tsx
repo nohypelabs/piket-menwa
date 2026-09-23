@@ -12,15 +12,17 @@ import {
 } from 'lucide-react';
 import {
   cancelSwapRemote, clearPin, clearWeekRosterRemote, createSwapRemote, decideSwapRemote,
-  dropPush, ensurePush, loadAttendance, loadChecks, loadEvidence, loadFaces,
+  dropPush, ensurePush, loadAttendance, loadBreakdown, loadChecks, loadEvidence, loadFaceSummary,
+  loadNilaiToday, matchFace,
   loadLapsit, loadState, loadWeekRoster, localChecks, loginPin, markAttendance, ping, isOnline,
-  registerMember, saveRosterRemote, saveWeekRosterRemote, setLoginPin, submitLapsit, uploadEvidence, verifyPin,
-  type AppState, type AttRow, type EvidenceRow, type FaceRow, type LapsitRow,
+  registerMember, saveRosterRemote, saveWeekRosterRemote, setLoginPin, setProfilePhoto, submitLapsit,
+  toggleBreakdown, uploadEvidence, verifyPin,
+  type AppState, type AttRow, type EvidenceRow, type FaceSummary, type LapsitRow,
   type Member, type SwapRow, type TaskRow,
 } from './api';
-import { getGeo, stampPhoto, type Geo } from './bukti';
+import { getGeo, compressPhoto, stampPhoto, type Geo } from './bukti';
 import { BREAKDOWN } from './breakdown';
-import { descriptorFromVideo, ensureModels, getFaceApi, identify, photoFromVideo, ting, tingStage, warmAudio, yawFromVideo } from './face';
+import { descriptorFromVideo, ensureModels, getFaceApi, ting, tingStage, warmAudio, yawFromVideo } from './face';
 import { ProfilePage, WelcomePage, profileSchema, type Profile } from './Welcome';
 import SuperView from './Super';
 import { DAYS, dateStr, load, memberById, save, todayKeyID, tomorrowKeyID, type DayKey } from './piket';
@@ -64,12 +66,14 @@ function Toast({ t, onClose }: { t: { msg: string; kind: 'error' | 'ok' | 'info'
 }
 
 // Modal kamera selfie: sekali-ambil (verifikasi/absen) atau burst (daftar).
-function FaceCam({ title, note, enroll, enrolled, onShot, onEnroll, onClose, onRescan, onDuplicate, onPinLogin }: {
+function FaceCam({ title, note, enroll, onShot, onEnroll, onClose, onRescan, onDuplicate, onPinLogin, checkDuplicate }: {
   title: string; note: string | null; enroll?: boolean;
-  enrolled: { memberId: string; descriptors: number[][] }[];
-  onShot: (d: number[]) => void; onEnroll: (ds: number[][], photo: string | null) => void;
+  onShot: (d: number[]) => void; onEnroll: (ds: number[][]) => void;
   onClose: () => void; onRescan?: () => void; onDuplicate?: (memberId: string) => void;
   onPinLogin?: (pin: string) => Promise<{ ok: boolean; error?: string }>;
+  // Cek server: descriptor ini sudah terdaftar sebagai siapa? (tidak pernah
+  // menerima embedding member lain ke client — cukup hasil match saja)
+  checkDuplicate: (d: number[]) => Promise<{ memberId: string } | null>;
 }) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const liveRef = useRef(true);
@@ -296,7 +300,7 @@ function FaceCam({ title, note, enroll, enrolled, onShot, onEnroll, onClose, onR
             if (d) {
               // Cek duplikat SEJAK tahap 1 — wajah dikenal langsung ditolak,
               // tidak perlu menunggu 3 tahap selesai.
-              const dupe = identify(d, enrolled);
+              const dupe = await checkDuplicate(d);
               if (dupe) {
                 R.stage = 'idle';
                 setStage('idle');
@@ -375,7 +379,7 @@ function FaceCam({ title, note, enroll, enrolled, onShot, onEnroll, onClose, onR
               setStage('done');
               setStageFrac(1);
               setStatus('Semua tahap terekam — menyimpan…');
-              onEnrollRef.current(R.descs.slice(0, 3), photoFromVideo(v));
+              onEnrollRef.current(R.descs.slice(0, 3));
             } else {
               setStatus('Gagal merekam — geser lagi.');
               R.ok = 0;
@@ -659,7 +663,8 @@ export default function App() {
   const [bdOpen, setBdOpen] = useState<Record<number, boolean>>({});
   const [buktiOpen, setBuktiOpen] = useState(true);
   const [bdDone, setBdDone] = useState<string[]>([]);
-  const [faces, setFaces] = useState<FaceRow[]>([]);
+  const [nilaiHariIni, setNilaiHariIni] = useState<number | null>(null);
+  const [faces, setFaces] = useState<FaceSummary[]>([]);
   const [att, setAtt] = useState<AttRow[]>([]);
   const [unlocked, setUnlocked] = useState(false); // wajah terverifikasi sesi ini
   const [cam, setCam] = useState<null | { mode: 'absen' | 'login' | 'register' }>(null);
@@ -680,10 +685,45 @@ export default function App() {
   const [regPin, setRegPin] = useState('');
   const [profiling, setProfiling] = useState(false);
   const [showUnknown, setShowUnknown] = useState(false);
+  // Hasil identifikasi wajah yang MENUNGGU KONFIRMASI USER sebelum benar-benar
+  // login — mencegah kasus salah-kenali (2 wajah mirip di kamera murah) yang
+  // langsung login-kan orang ke akun orang lain tanpa sempat dicek.
+  const [confirmHit, setConfirmHit] = useState<{ memberId: string; ambiguous: boolean } | null>(null);
   const [navHidden, setNavHidden] = useState(false);
   const [showLogout, setShowLogout] = useState(false);
   const [pinNew, setPinNew] = useState('');
   const [pinMsg, setPinMsg] = useState<string | null>(null);
+  const [avatarBusy, setAvatarBusy] = useState(false);
+  const avatarInputRef = useRef<HTMLInputElement>(null);
+
+  // Foto profil OPSIONAL (avatar) — file dipilih manual dari galeri/kamera,
+  // BUKAN dari proses scan wajah biometrik. Dikompres dulu spy hemat data.
+  const onAvatarFile = async (f: File | undefined) => {
+    if (!f || !me) return;
+    setAvatarBusy(true);
+    try {
+      const dataUrl = await compressPhoto(f);
+      const res = await setProfilePhoto(me, dataUrl);
+      if (res.ok) {
+        await refresh();
+        setToast({ msg: 'Foto profil diperbarui', kind: 'ok' });
+      } else {
+        setToast({ msg: res.error ?? 'Gagal ganti foto', kind: 'error' });
+      }
+    } catch {
+      setToast({ msg: 'Gagal baca foto', kind: 'error' });
+    } finally {
+      setAvatarBusy(false);
+      if (avatarInputRef.current) avatarInputRef.current.value = '';
+    }
+  };
+  const removeAvatar = async () => {
+    if (!me) return;
+    setAvatarBusy(true);
+    const res = await setProfilePhoto(me, '');
+    setAvatarBusy(false);
+    if (res.ok) { await refresh(); setToast({ msg: 'Foto profil dihapus', kind: 'ok' }); }
+  };
 
   const pinLogin = async (pin: string) => {
     const r = await loginPin(pin);
@@ -759,16 +799,19 @@ export default function App() {
     const s = await loadState();
     setState(s);
     if (!s.fromApi) save('piket-schedule', s.schedule);
-    const c = s.fromApi ? await loadChecks() : null;
+    const c = s.fromApi && me ? await loadChecks(dateStr(0), me) : null;
     setChecks(c ?? localChecks());
-    const e = s.fromApi ? await loadEvidence(dateStr(0), dateStr(0)) : null;
+    const e = s.fromApi ? await loadEvidence(dateStr(0), dateStr(0), admin ? undefined : me || undefined) : null;
     setEv(e ?? []);
-    setBdDone(load<string[]>(`piket-bd-${dateStr(0)}`, []));
+    setBdDone(
+      s.fromApi && me ? await loadBreakdown(dateStr(0), me) : load<string[]>(`piket-bd-${dateStr(0)}-${me}`, []),
+    );
+    setNilaiHariIni(s.fromApi && me ? await loadNilaiToday(dateStr(0), me) : null);
     if (s.fromApi) {
-      setFaces(await loadFaces());
+      setFaces(admin ? await loadFaceSummary() : []);
       const a = await loadAttendance(dateStr(0), dateStr(0));
       setAtt(a ?? []);
-      setLapsit((await loadLapsit(dateStr(0), dateStr(0))) ?? []);
+      setLapsit((await loadLapsit(dateStr(0), dateStr(0), admin ? undefined : me || undefined)) ?? []);
       // Notifikasi pengajuan tukar baru (untuk yang diminta / Admin).
       const pend = s.swaps.filter((x) => x.status === 'pending');
       if (knownSwaps.current) {
@@ -823,6 +866,25 @@ export default function App() {
   const crew: string[] = today === 'Libur' ? [] : (state?.schedule[today] ?? []);
   const crewBesok: string[] = tmr === 'Libur' ? [] : (state?.schedule[tmr] ?? []);
   const jamHari = today === 'Libur' ? '' : (state?.jam[today] ?? '09.00–15.00');
+  // Lapsit cuma boleh dikirim 30 menit sebelum jam selesai piket HARI INI.
+  // Estimasi tampilan pakai jadwal template (state.jam) — kalau admin
+  // override jam khusus minggu ini via drag-drop, validasi FINAL tetap di
+  // server (endpoint akan tolak dgn pesan jelas kalau estimasi ini meleset).
+  const jamSelesaiHariIni = jamHari ? jamHari.split('–')[1] ?? '' : '';
+  const lapsitOpenAt = (() => {
+    if (!jamSelesaiHariIni) return '';
+    const [hh, mm] = jamSelesaiHariIni.split('.').map(Number);
+    if (Number.isNaN(hh) || Number.isNaN(mm)) return '';
+    const t = new Date(); t.setHours(hh, mm - 30, 0, 0);
+    return `${String(t.getHours()).padStart(2, '0')}.${String(t.getMinutes()).padStart(2, '0')}`;
+  })();
+  const lapsitOpen = (() => {
+    if (!jamSelesaiHariIni) return true; // gak ada jadwal jam → jangan block
+    const [hh, mm] = jamSelesaiHariIni.split('.').map(Number);
+    if (Number.isNaN(hh) || Number.isNaN(mm)) return true;
+    const batas = new Date(); batas.setHours(hh, mm - 30, 0, 0);
+    return new Date() >= batas;
+  })();
   const doneCount = checks.filter((c) => c.done).length;
   const pending = (state?.swaps ?? []).filter((s) => s.status === 'pending');
   const incoming = pending.filter((s) => s.target === me);
@@ -863,8 +925,8 @@ export default function App() {
     let live = true;
     (async () => {
       const out: Record<string, boolean> = {};
-      const evRows = state?.fromApi ? await loadEvidence(weekDates[0], weekDates[4]) : null;
-      const lapRows = state?.fromApi ? await loadLapsit(weekDates[0], weekDates[4]) : null;
+      const evRows = state?.fromApi && admin ? await loadEvidence(weekDates[0], weekDates[4]) : null;
+      const lapRows = state?.fromApi && admin ? await loadLapsit(weekDates[0], weekDates[4]) : null;
       if (live) {
         const grouped: Record<string, EvidenceRow[]> = {};
         for (const e of evRows ?? []) {
@@ -872,24 +934,25 @@ export default function App() {
         }
         setWeekEv(grouped);
       }
-      await Promise.all(weekDates.map(async (ds) => {
-        let rows: TaskRow[] | null = null;
-        if (state?.fromApi) {
-          rows = await loadChecks(ds);
-        } else {
-          rows = localChecks(ds);
-        }
-        const tasksDone = !!rows?.length && rows.every((r) => r.done);
-        if (!tasksDone) return;
-        // tiap tugas wajib ada 1 foto (siapa pun boleh upload) + lapsit terkirim
-        let evOk = true;
-        if (state?.fromApi && evRows) {
+      if (!admin) { if (live) setWeekStat({}); return; } // non-admin: rekap tim tidak dibuka (privasi per-orang)
+      await Promise.all(weekDates.map(async (ds, i) => {
+        const dayKey = DAYS[i]; // weekDates disusun Senin..Jumat, selaras index DAYS
+        const dayCrew = state?.schedule[dayKey] ?? [];
+        if (dayCrew.length === 0) return;
+        // SEMUA anggota yang piket hari itu wajib lengkap sendiri-sendiri
+        // (checklist + foto miliknya) — bukan cukup salah satu orang saja.
+        const memberDone = await Promise.all(dayCrew.map(async (mid) => {
+          const rows = state?.fromApi ? await loadChecks(ds, mid) : localChecks(ds);
+          const tasksDone = !!rows?.length && rows.every((r) => r.done);
+          if (!tasksDone) return false;
+          if (!state?.fromApi || !evRows) return tasksDone;
           const titles = (rows ?? []).map((r) => r.judul);
-          evOk = titles.length > 0 && titles.every((t) =>
-            evRows.some((e) => e.tanggal === ds && e.tugas === t));
-        }
-        const lapOk = !state?.fromApi || !lapRows ? evOk : (lapRows ?? []).some((l) => l.tanggal === ds);
-        if (evOk && lapOk) out[ds] = true;
+          const evOk = titles.length > 0 && titles.every((t) =>
+            evRows.some((e) => e.tanggal === ds && e.tugas === t && e.memberId === mid));
+          const lapOk = !lapRows || lapRows.some((l) => l.tanggal === ds && l.memberId === mid);
+          return evOk && lapOk;
+        }));
+        if (memberDone.every(Boolean)) out[ds] = true;
       }));
       if (live) setWeekStat(out);
     })();
@@ -996,9 +1059,10 @@ export default function App() {
         alert(res.error ?? 'Gagal upload');
       } else {
         // server otomatis menandai tugas selesai → refresh keduanya
-        const [c, e] = await Promise.all([loadChecks(dateStr(0)), loadEvidence(dateStr(0), dateStr(0))]);
+        const [c, e] = await Promise.all([loadChecks(dateStr(0), me), loadEvidence(dateStr(0), dateStr(0), admin ? undefined : me || undefined)]);
         if (c) setChecks(c);
         if (e) setEv(e);
+        if (me) setNilaiHariIni(await loadNilaiToday(dateStr(0), me));
       }
     } catch {
       alert('Baca/kompres foto gagal');
@@ -1016,8 +1080,15 @@ export default function App() {
   const toggleBd = (key: string) => {
     if (!unlocked) return needVerify();
     setBdDone((prev) => {
-      const next = prev.includes(key) ? prev.filter((k) => k !== key) : [...prev, key];
-      save(`piket-bd-${dateStr(0)}`, next);
+      const willDo = !prev.includes(key);
+      const next = willDo ? [...prev, key] : prev.filter((k) => k !== key);
+      if (state?.fromApi && me) {
+        void toggleBreakdown(dateStr(0), me, key, willDo).then(() => {
+          void loadNilaiToday(dateStr(0), me).then(setNilaiHariIni);
+        });
+      } else {
+        save(`piket-bd-${dateStr(0)}-${me}`, next);
+      }
       return next;
     });
   };
@@ -1030,8 +1101,9 @@ export default function App() {
     const res = await submitLapsit(dateStr(0), me, lapsitText, g);
     if (!res.ok) return alert(res.error ?? 'Gagal kirim lapsit');
     setLapsitText('');
-    const rows = await loadLapsit(dateStr(0), dateStr(0));
+    const rows = await loadLapsit(dateStr(0), dateStr(0), admin ? undefined : me || undefined);
     if (rows) setLapsit(rows);
+    if (me) setNilaiHariIni(await loadNilaiToday(dateStr(0), me));
   };
 
   const needVerify = () => {
@@ -1078,20 +1150,16 @@ export default function App() {
     setToast({ msg, kind: 'error' });
   };
 
-  const handleEnroll = async (ds: number[][], photo: string | null) => {
+  const handleEnroll = async (ds: number[][]) => {
     const parsed = profileSchema.safeParse({ nama: regName, angkatan: regAngkatan, jabatan: regJabatan, pin: regPin });
     if (!parsed.success) {
       setCamMsg(parsed.error.issues[0]?.message ?? 'Profil invalid.');
       return;
     }
-    if (!photo) {
-      setCamMsg('Foto gagal diambil, coba lagi.');
-      return;
-    }
-    // Tolak wajah yang sudah terdaftar (nama beda pun tetap ketahuan)
-    const enrolled = faces.map((f) => ({ memberId: f.memberId, descriptors: f.descriptors }));
+    // Tolak wajah yang sudah terdaftar (nama beda pun tetap ketahuan) — cek
+    // di SERVER, bukan bandingkan array embedding di browser.
     for (const d of ds) {
-      const dupe = identify(d, enrolled);
+      const dupe = await matchFace(d);
       if (dupe) {
         const msg = `Wajah ini sudah terdaftar sebagai ${nama(dupe.memberId)} — pakai Masuk, jangan daftar lagi.`;
         setCamMsg(msg);
@@ -1099,7 +1167,7 @@ export default function App() {
         return;
       }
     }
-    const res = await registerMember(parsed.data.nama, parsed.data.angkatan, parsed.data.jabatan, parsed.data.pin, ds, photo);
+    const res = await registerMember(parsed.data.nama, parsed.data.angkatan, parsed.data.jabatan, parsed.data.pin, ds);
     if (res.ok && res.memberId) {
       const hello = `${parsed.data.nama} (${parsed.data.jabatan}, angkatan ${parsed.data.angkatan})`;
       await refresh();
@@ -1123,35 +1191,30 @@ export default function App() {
 
   const handleDescriptor = async (d: number[]) => {
     if (!cam) return;
-    const enrolled = faces.map((f) => ({ memberId: f.memberId, descriptors: f.descriptors }));
     if (cam.mode === 'login') {
-      const hit = identify(d, enrolled);
+      const hit = await matchFace(d);
       if (!hit) {
         setCam(null);
         setCamMsg(null);
         setShowUnknown(true); // wajah baru → suruh daftar dulu
         return;
       }
-      setMe(hit.memberId);
-      // Sinkronkan status "sudah verifikasi hari ini" milik akun BARU ini —
-      // jangan warisi status dari akun sebelumnya yang mungkin masih login
-      // di device yang sama (lihat catatan unlockKey di atas).
-      setUnlocked(sessionStorage.getItem(unlockKey(hit.memberId)) === dateStr(0));
-      ting(990, 0.18); // masuk
-      setToast({ msg: `Login berhasil — selamat datang, ${nama(hit.memberId)}`, kind: 'ok' });
-      void ensurePush(hit.memberId);
+      // Selalu minta konfirmasi visual eksplisit sebelum benar-benar login —
+      // wajah dari kamera murah/cahaya kurang bisa mirip antar 2 orang beda,
+      // jadi jangan langsung percaya hasil algoritma tanpa user cek foto.
       setCam(null);
       setCamMsg(null);
+      setConfirmHit({ memberId: hit.memberId, ambiguous: !!hit.ambiguous });
       return;
     }
     if (cam.mode !== 'absen') return;
-    const hit = identify(d, enrolled);
+    const hit = await matchFace(d);
     if (!hit) {
       setCamMsg('Wajah tidak dikenal — Daftar dulu ya.');
       return;
     }
-    if (hit.memberId !== me) {
-      setCamMsg(`Terdeteksi ${nama(hit.memberId)}, bukan ${nama(me)} — keluar lalu masuk lagi, atau coba lagi.`);
+    if (hit.memberId !== me || hit.ambiguous) {
+      setCamMsg(`Terdeteksi ${nama(hit.memberId)}${hit.ambiguous ? ' (kurang yakin)' : ''}, bukan ${nama(me)} — keluar lalu masuk lagi, atau coba lagi dengan pencahayaan lebih baik.`);
       return;
     }
     await markAttendance(dateStr(0), me);
@@ -1165,6 +1228,24 @@ export default function App() {
     void getGeo().then(setGeo); // siapkan koordinat untuk stempel foto
     setCam(null);
     setCamMsg(null);
+  };
+
+  // Konfirmasi identitas hasil pindaian wajah sebelum login benar-benar
+  // dieksekusi — user melihat foto+nama match lalu tegas menyatakan
+  // "ini saya" atau menolaknya (mencegah insiden salah-login akun orang lain).
+  const confirmLogin = () => {
+    if (!confirmHit) return;
+    const hit = confirmHit;
+    setConfirmHit(null);
+    setMe(hit.memberId);
+    setUnlocked(sessionStorage.getItem(unlockKey(hit.memberId)) === dateStr(0));
+    ting(990, 0.18); // masuk
+    setToast({ msg: `Login berhasil — selamat datang, ${nama(hit.memberId)}`, kind: 'ok' });
+    void ensurePush(hit.memberId);
+  };
+  const rejectLogin = () => {
+    setConfirmHit(null);
+    setShowUnknown(true); // "bukan saya" → tawarkan daftar / coba lagi
   };
 
   const submitSwap = async () => {
@@ -1382,12 +1463,12 @@ export default function App() {
           : `Absen ${nama(me)}`}
           note={camMsg}
           enroll={cam.mode === 'register'}
-          enrolled={faces.map((f) => ({ memberId: f.memberId, descriptors: f.descriptors }))}
           onShot={(d) => void handleDescriptor(d)}
-          onEnroll={(ds, photo) => void handleEnroll(ds, photo)}
+          onEnroll={(ds) => void handleEnroll(ds)}
           onClose={() => { setCam(null); setCamMsg(null); }}
           onRescan={() => setCamMsg(null)}
           onDuplicate={handleDuplicate}
+          checkDuplicate={matchFace}
           onPinLogin={async (pin) => {
             const r = await pinLogin(pin);
             if (r.ok) {
@@ -1429,6 +1510,43 @@ export default function App() {
               </motion.div>
             </motion.div>
           )}
+        </AnimatePresence>
+        <AnimatePresence>
+          {confirmHit && (() => {
+            const cand = members.find((m) => m.id === confirmHit.memberId);
+            return (
+              <motion.div
+                className="preview"
+                initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
+                transition={{ duration: 0.2 }}
+              >
+                <motion.div
+                  className="pvcard" onClick={(e) => e.stopPropagation()}
+                  initial={{ opacity: 0, scale: 0.94, y: 14 }}
+                  animate={{ opacity: 1, scale: 1, y: 0 }}
+                  exit={{ opacity: 0, scale: 0.96, y: 10 }}
+                  transition={{ duration: 0.22, ease: 'easeOut' }}
+                >
+                  <b>{confirmHit.ambiguous ? 'Kurang yakin — ini kamu?' : 'Konfirmasi identitas'}</b>
+                  <div className="confirmid">
+                    {cand?.foto
+                      ? <img className="ava lg" src={cand.foto} alt={cand?.nama ?? ''} />
+                      : <i className="pdot lg" style={{ background: cand?.warna ?? '#6b7280' }} />}
+                    <span>{cand?.nama ?? confirmHit.memberId}</span>
+                  </div>
+                  <span className="hint">
+                    {confirmHit.ambiguous
+                      ? 'Wajahmu mirip lebih dari 1 orang terdaftar. Pastikan benar sebelum lanjut — kalau ragu, pilih "Bukan saya" dan coba pindai ulang dengan pencahayaan lebih baik.'
+                      : 'Cek foto & nama di atas — ini kamu?'}
+                  </span>
+                  <div className="row">
+                    <button className="primary" onClick={confirmLogin}>Ya, ini saya</button>
+                    <button onClick={rejectLogin}>Bukan saya</button>
+                  </div>
+                </motion.div>
+              </motion.div>
+            );
+          })()}
         </AnimatePresence>
         <AnimatePresence>{camModal}</AnimatePresence>
         <AnimatePresence>
@@ -1506,6 +1624,18 @@ export default function App() {
               {meMember.foto
                 ? <img className="sheetava" src={meMember.foto} alt={meMember.nama} />
                 : <i className="pdot big" style={{ background: meMember.warna }} />}
+              <input
+                ref={avatarInputRef} type="file" accept="image/*" hidden
+                onChange={(e) => void onAvatarFile(e.target.files?.[0])}
+              />
+              <div className="avatarrow">
+                <button className="ghostbtn sm" disabled={avatarBusy} onClick={() => avatarInputRef.current?.click()}>
+                  {avatarBusy ? 'memproses…' : meMember.foto ? 'Ganti foto profil' : 'Tambah foto profil'}
+                </button>
+                {meMember.foto && (
+                  <button className="ghostbtn sm" disabled={avatarBusy} onClick={() => void removeAvatar()}>Hapus foto</button>
+                )}
+              </div>
               <b>{meMember.nama}</b>
               <span className="hint">{[meMember.jabatan, meMember.angkatan].filter(Boolean).join(' · ')}</span>
               <div className="pinrow">
@@ -1630,7 +1760,10 @@ export default function App() {
                   </AnimatePresence>
                 </div>
                 <h2>Rincian Tugas (Opsional)</h2>
-                <p className="hint">Tanpa foto — cukup centang, tersimpan di HP ini.</p>
+                <p className="hint">
+                  Tercatat di server, ikut menentukan nilai piketmu.
+                  {nilaiHariIni != null && <> Nilai hari ini: <b>{nilaiHariIni}</b>/100.</>}
+                </p>
                 {BREAKDOWN.map((g, gi) => {
                   const done = g.items.filter((_, ii) => bdDone.includes(`${gi}:${ii}`)).length;
                   const open = !!bdOpen[gi];
@@ -1688,13 +1821,16 @@ export default function App() {
                     />
                     <button
                       className="bigbtn"
-                      disabled={!unlocked || ev.length < checks.length || checks.length === 0}
+                      disabled={!unlocked || ev.length < checks.length || checks.length === 0 || !lapsitOpen}
                       onClick={kirimLapsit}
                     >
                       Kirim lapsit akhir piket
                     </button>
                     {unlocked && (ev.length < checks.length) && (
                       <p className="hint">Lengkapi {checks.length} foto bukti dulu.</p>
+                    )}
+                    {unlocked && ev.length >= checks.length && checks.length > 0 && !lapsitOpen && (
+                      <p className="hint">Lapsit bisa dikirim mulai {lapsitOpenAt} (30 menit sebelum piket selesai jam {jamSelesaiHariIni}).</p>
                     )}
                   </>
                 )}
@@ -1816,7 +1952,7 @@ export default function App() {
                   : members.length === 0
                     ? <p className="hint">Belum ada yang daftar — suruh buka tab Hari Ini → Daftar.</p>
                     : members.map((m) => {
-                      const n = faces.find((f) => f.memberId === m.id)?.descriptors.length ?? 0;
+                      const n = faces.find((f) => f.memberId === m.id)?.count ?? 0;
                       return (
                         <div key={m.id} className="facerow">
                           {m.foto
@@ -1942,7 +2078,12 @@ export default function App() {
               exit={{ opacity: 0, scale: 0.96, y: 10 }}
               transition={{ duration: 0.22, ease: 'easeOut' }}
             >
-              <img src={preview.file} alt={preview.judul} />
+              <div className="wmwrap">
+                <img src={preview.file} alt={preview.judul} />
+                {admin && preview.by !== nama(me ?? '') && (
+                  <span className="wm">{nama(me ?? '') || 'Admin'} • {new Date().toLocaleString('id-ID')}</span>
+                )}
+              </div>
               <b>{preview.judul}</b>
               <span className="hint">oleh {preview.by} • {preview.tanggal.split('-').reverse().join('/')} • final, tidak bisa diubah</span>
               <div className="row">
