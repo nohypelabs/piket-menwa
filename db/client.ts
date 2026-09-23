@@ -29,7 +29,8 @@ CREATE TABLE IF NOT EXISTS members (
 CREATE TABLE IF NOT EXISTS roster (
   id INTEGER PRIMARY KEY AUTOINCREMENT, day TEXT NOT NULL,
   member_id TEXT NOT NULL REFERENCES members(id),
-  jam_mulai TEXT NOT NULL DEFAULT '09.00', jam_selesai TEXT NOT NULL DEFAULT '15.00'
+  jam_mulai TEXT NOT NULL DEFAULT '09.00', jam_selesai TEXT NOT NULL DEFAULT '15.00',
+  week_start TEXT
 );
 CREATE TABLE IF NOT EXISTS tasks (
   id INTEGER PRIMARY KEY AUTOINCREMENT, tanggal TEXT NOT NULL,
@@ -144,6 +145,13 @@ try {
     sqlite.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_pin_unique ON members(pin_hash)');
     console.log('migrasi members +pin_hash ok');
   }
+  const rcols = sqlite.prepare('PRAGMA table_info(roster)').all() as { name: string }[];
+  if (!rcols.some((c) => c.name === 'week_start')) {
+    sqlite.exec('ALTER TABLE roster ADD COLUMN week_start TEXT');
+    console.log('migrasi roster +week_start ok');
+  }
+  // 1 override per (minggu, hari, anggota) — cegah duplikat drag-drop yang gagal di-clean.
+  sqlite.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_roster_week_uniq ON roster(week_start, day, member_id) WHERE week_start IS NOT NULL');
 } catch { /* DB fresh, lewati */ }
 
 export const db: BetterSQLite3Database<typeof schema> = drizzle(sqlite, { schema });

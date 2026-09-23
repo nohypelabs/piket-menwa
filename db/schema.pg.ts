@@ -25,6 +25,7 @@ export const roster = pgTable('roster', {
     .references(() => members.id),
   jamMulai: text('jam_mulai').notNull().default('09.00'),
   jamSelesai: text('jam_selesai').notNull().default('15.00'),
+  weekStart: text('week_start'), // NULL = template berulang; else override minggu ybs
 });
 
 export const tasks = pgTable('tasks', {

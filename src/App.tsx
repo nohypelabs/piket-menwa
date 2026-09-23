@@ -1,15 +1,20 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { AnimatePresence, motion } from 'framer-motion';
 import {
-  ArrowLeftRight, Bell, CalendarDays, CalendarRange, Camera, Check, Clock, Info, Lock,
+  DndContext, DragOverlay, PointerSensor, TouchSensor, closestCenter,
+  useDraggable, useDroppable, useSensor, useSensors,
+  type DragEndEvent, type DragStartEvent,
+} from '@dnd-kit/core';
+import {
+  ArrowLeftRight, Bell, CalendarDays, CalendarRange, Camera, Check, ChevronDown, Clock, GripVertical, Info, Lock,
   LockOpen, PartyPopper, Plus, Repeat, RotateCw, ScanFace, Settings,
   TriangleAlert, X,
 } from 'lucide-react';
 import {
-  cancelSwapRemote, clearPin, createSwapRemote, decideSwapRemote,
+  cancelSwapRemote, clearPin, clearWeekRosterRemote, createSwapRemote, decideSwapRemote,
   dropPush, ensurePush, loadAttendance, loadChecks, loadEvidence, loadFaces,
-  loadLapsit, loadState, localChecks, loginPin, markAttendance, ping, isOnline,
-  registerMember, saveRosterRemote, setLoginPin, submitLapsit, uploadEvidence, verifyPin,
+  loadLapsit, loadState, loadWeekRoster, localChecks, loginPin, markAttendance, ping, isOnline,
+  registerMember, saveRosterRemote, saveWeekRosterRemote, setLoginPin, submitLapsit, uploadEvidence, verifyPin,
   type AppState, type AttRow, type EvidenceRow, type FaceRow, type LapsitRow,
   type Member, type SwapRow, type TaskRow,
 } from './api';
@@ -22,10 +27,25 @@ import { DAYS, dateStr, load, memberById, save, todayKeyID, tomorrowKeyID, type 
 
 type Tab = 'hari' | 'minggu' | 'tukar';
 
+// Flag "sudah verifikasi wajah hari ini" harus terikat PER-ANGGOTA, bukan
+// cuma per-tanggal — device sering gantian dipakai beberapa anggota piket
+// (satu HP/tablet bersama). Kalau cuma per-tanggal, anggota kedua yang
+// login di device yang sama otomatis kebaca "unlocked" dari sesi anggota
+// pertama walau dia sendiri belum verifikasi (bug tombol absen kedip lalu
+// hilang: sempat unlocked=false sesaat, lalu ke-overwrite true oleh flag
+// stale milik orang lain begitu `me` di-set).
+const unlockKey = (memberId: string) => `piket-unlock-date:${memberId}`;
+
 const fmtTanggal = new Intl.DateTimeFormat('id-ID', { weekday: 'long', day: 'numeric', month: 'long' });
 const todayLong = () => {
   const s = fmtTanggal.format(new Date());
   return s.charAt(0).toUpperCase() + s.slice(1);
+};
+
+const tabTitle: Record<Tab, string> = {
+  hari: 'Jadwal Piket Hari Ini',
+  minggu: 'Jadwal Mingguan',
+  tukar: 'Tukar Jadwal',
 };
 
 // Toast global (error/info/ok) dengan animasi framer-motion.
@@ -484,6 +504,144 @@ function FaceCam({ title, note, enroll, enrolled, onShot, onEnroll, onClose, onR
   );
 }
 
+// ---- Drag-drop jadwal mingguan (minggu depan/seterusnya) ----
+// Kartu anggota yang bisa di-drag antar kolom hari. Dipakai di dalam
+// DndContext (lihat WeekDragBoard) — posisi ditata pakai @dnd-kit/core murni
+// (bukan sortable list) karena tujuannya pindah kartu ANTAR kolom, bukan
+// reorder dalam 1 list.
+function DragMemberCard({ id, nama, warna, foto, disabled }: {
+  id: string; nama: string; warna: string; foto: string | null; disabled?: boolean;
+}) {
+  const { attributes, listeners, setNodeRef, transform, isDragging } = useDraggable({ id, disabled });
+  const style = transform
+    ? { transform: `translate3d(${transform.x}px, ${transform.y}px, 0)`, zIndex: 50 }
+    : undefined;
+  const firstName = nama.split(' ')[0];
+  return (
+    <div
+      ref={setNodeRef}
+      style={style}
+      className={`dragcard ${isDragging ? 'dragging' : ''}`}
+      title={nama}
+      {...attributes}
+      {...listeners}
+    >
+      {foto
+        ? <img className="ava" src={foto} alt={nama} />
+        : <i className="pdot" style={{ background: warna }} />}
+      <span>{firstName}</span>
+      {!disabled && <GripVertical size={11} className="griphandle" />}
+    </div>
+  );
+}
+
+// Kolom 1 hari — droppable area tempat kartu di-lepas.
+function DragDayColumn({ day, abbr, dateNum, isToday, ids, members, disabled }: {
+  day: DayKey; abbr: string; dateNum: number; isToday: boolean;
+  ids: string[]; members: Member[]; disabled?: boolean;
+}) {
+  const { setNodeRef, isOver } = useDroppable({ id: day, disabled });
+  return (
+    <div ref={setNodeRef} className={`dragcol ${isToday ? 'now' : ''} ${isOver ? 'over' : ''}`}>
+      <div className="dragcolhd"><b>{abbr}</b><span>{dateNum}</span></div>
+      <div className="dragcolbody">
+        {ids.map((id) => {
+          const m = members.find((x) => x.id === id);
+          return (
+            <DragMemberCard
+              key={id} id={`${day}::${id}`}
+              nama={m?.nama ?? id} warna={m?.warna ?? '#6b7280'} foto={m?.foto ?? null}
+              disabled={disabled}
+            />
+          );
+        })}
+        {ids.length === 0 && <p className="dragempty">kosong</p>}
+      </div>
+    </div>
+  );
+}
+
+// Papan drag-drop 5 kolom (Senin-Jumat) untuk 1 minggu spesifik. State draft
+// dikelola di App (dragSchedule) — komponen ini murni UI + DndContext.
+function WeekDragBoard({
+  weekLoading, dragSchedule, dragDirty, dragSaving, weekOverridden, weekDates, members,
+  onMove, onSave, onReset, onClearOverride,
+}: {
+  weekLoading: boolean; dragSchedule: Record<DayKey, string[]> | null;
+  dragDirty: boolean; dragSaving: boolean; weekOverridden: boolean;
+  weekDates: string[]; members: Member[];
+  onMove: (memberId: string, fromDay: DayKey, toDay: DayKey) => void;
+  onSave: () => void; onReset: () => void; onClearOverride: () => void;
+}) {
+  const [activeId, setActiveId] = useState<string | null>(null);
+  const sensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { distance: 6 } }),
+    useSensor(TouchSensor, { activationConstraint: { delay: 150, tolerance: 6 } }),
+  );
+  const ABBR2 = ['Sen', 'Sel', 'Rab', 'Kam', 'Jum'];
+  const today = dateStr(0);
+
+  const onDragStart = (e: DragStartEvent) => setActiveId(String(e.active.id));
+  const onDragEnd = (e: DragEndEvent) => {
+    setActiveId(null);
+    const { active, over } = e;
+    if (!over) return;
+    const [fromDay, memberId] = String(active.id).split('::') as [DayKey, string];
+    const toDay = over.id as DayKey;
+    onMove(memberId, fromDay, toDay);
+  };
+
+  if (weekLoading || !dragSchedule) {
+    return <p className="hint">Memuat jadwal minggu ini…</p>;
+  }
+
+  const activeMemberId = activeId ? activeId.split('::')[1] : null;
+  const activeMember = members.find((m) => m.id === activeMemberId);
+
+  return (
+    <div className="dragboard">
+      <p className="hint">
+        <GripVertical size={12} /> Seret kartu anggota antar hari untuk atur jadwal minggu ini.
+        {weekOverridden && <> Minggu ini punya susunan khusus (beda dari jadwal dasar).</>}
+      </p>
+      <DndContext sensors={sensors} collisionDetection={closestCenter} onDragStart={onDragStart} onDragEnd={onDragEnd}>
+        <div className="dragcols">
+          {DAYS.map((d, i) => (
+            <DragDayColumn
+              key={d} day={d} abbr={ABBR2[i]}
+              dateNum={new Date(weekDates[i] + 'T00:00').getDate()}
+              isToday={weekDates[i] === today}
+              ids={dragSchedule[d]} members={members}
+              disabled={dragSaving}
+            />
+          ))}
+        </div>
+        <DragOverlay>
+          {activeMember && (
+            <div className="dragcard dragging overlay">
+              {activeMember.foto
+                ? <img className="ava" src={activeMember.foto} alt={activeMember.nama} />
+                : <i className="pdot" style={{ background: activeMember.warna }} />}
+              <span>{activeMember.nama}</span>
+            </div>
+          )}
+        </DragOverlay>
+      </DndContext>
+      <div className="dragactions">
+        <button className="ghostbtn sm" onClick={onReset} disabled={!dragDirty || dragSaving}>Batal</button>
+        {weekOverridden && (
+          <button className="ghostbtn sm danger" onClick={onClearOverride} disabled={dragSaving}>
+            Kembalikan ke dasar
+          </button>
+        )}
+        <button className="primary sm" onClick={onSave} disabled={!dragDirty || dragSaving}>
+          {dragSaving ? 'Menyimpan…' : 'Simpan jadwal minggu ini'}
+        </button>
+      </div>
+    </div>
+  );
+}
+
 export default function App() {
   const [tab, setTab] = useState<Tab>('hari');
   const [state, setState] = useState<AppState | null>(null);
@@ -499,6 +657,7 @@ export default function App() {
   const [lapsit, setLapsit] = useState<LapsitRow[]>([]);
   const [lapsitText, setLapsitText] = useState('');
   const [bdOpen, setBdOpen] = useState<Record<number, boolean>>({});
+  const [buktiOpen, setBuktiOpen] = useState(true);
   const [bdDone, setBdDone] = useState<string[]>([]);
   const [faces, setFaces] = useState<FaceRow[]>([]);
   const [att, setAtt] = useState<AttRow[]>([]);
@@ -532,7 +691,7 @@ export default function App() {
       setMe(r.memberId);
       setToast({ msg: `Login berhasil — selamat datang, ${r.nama}`, kind: 'ok' });
       void ensurePush(r.memberId);
-      try { sessionStorage.setItem('piket-unlock-date', dateStr(0)); } catch { /* abaikan */ }
+      try { sessionStorage.setItem(unlockKey(r.memberId), dateStr(0)); } catch { /* abaikan */ }
       setUnlocked(true);
     }
     return r;
@@ -559,6 +718,14 @@ export default function App() {
   const [weekStat, setWeekStat] = useState<Record<string, boolean>>({});
   const [expanded, setExpanded] = useState<string | null>(null);
   const [pickDay, setPickDay] = useState<DayKey | null>(null);
+  // ---- Mingguan minggu depan/seterusnya: override per-minggu (drag-drop) ----
+  const [weekSchedule, setWeekSchedule] = useState<Record<DayKey, string[]> | null>(null);
+  const [weekJamRow, setWeekJamRow] = useState<Record<DayKey, string>>({} as Record<DayKey, string>);
+  const [weekOverridden, setWeekOverridden] = useState(false);
+  const [weekLoading, setWeekLoading] = useState(false);
+  const [dragSchedule, setDragSchedule] = useState<Record<DayKey, string[]> | null>(null);
+  const [dragDirty, setDragDirty] = useState(false);
+  const [dragSaving, setDragSaving] = useState(false);
 
   useEffect(() => { save('piket-me', me); }, [me]);
   useEffect(() => {
@@ -625,7 +792,7 @@ export default function App() {
       setAtt([]);
       setLapsit([]);
     }
-    setUnlocked(sessionStorage.getItem('piket-unlock-date') === dateStr(0));
+    setUnlocked(me !== '' && sessionStorage.getItem(unlockKey(me)) === dateStr(0));
   };
   useEffect(() => { void refresh(); }, []);
 
@@ -728,6 +895,33 @@ export default function App() {
     })();
     return () => { live = false; };
   }, [tab, weekOff, state?.fromApi]);
+
+  // Minggu depan & seterusnya (weekOff !== 0): jadwal bisa beda dari template,
+  // di-drag-drop terpisah per minggu (lihat db/roster.weekStart + /api/roster/week).
+  // Minggu berjalan (weekOff === 0) tetap ikut template dasar seperti sebelumnya.
+  useEffect(() => {
+    if (tab !== 'minggu' || weekOff === 0 || !state?.fromApi) {
+      setWeekSchedule(null);
+      setDragSchedule(null);
+      setDragDirty(false);
+      return;
+    }
+    let live = true;
+    setWeekLoading(true);
+    (async () => {
+      const w = await loadWeekRoster(weekDates[0]);
+      if (!live) return;
+      setWeekLoading(false);
+      if (!w) return;
+      setWeekSchedule(w.schedule);
+      setWeekJamRow(w.jam);
+      setWeekOverridden(w.overridden);
+      setDragSchedule(w.schedule);
+      setDragDirty(false);
+    })();
+    return () => { live = false; };
+  }, [tab, weekOff, weekDates, state?.fromApi]);
+
 
   const rangeLabel = (() => {
     const a = new Date(weekDates[0] + 'T00:00');
@@ -860,10 +1054,10 @@ export default function App() {
 
   const logout = () => {
     void dropPush();
+    try { if (me) sessionStorage.removeItem(unlockKey(me)); } catch { /* abaikan */ }
     setMe('');
     setUnlocked(false);
     setShowLogout(false);
-    try { sessionStorage.removeItem('piket-unlock-date'); } catch { /* abaikan */ }
   };
 
   const onProfileDone = (p: Profile) => {
@@ -911,7 +1105,7 @@ export default function App() {
       await refresh();
       setMe(res.memberId);
       setUnlocked(true); // wajah baru saja diverifikasi → langsung terbuka
-      try { sessionStorage.setItem('piket-unlock-date', dateStr(0)); } catch { /* abaikan */ }
+      try { sessionStorage.setItem(unlockKey(res.memberId), dateStr(0)); } catch { /* abaikan */ }
       if (res.memberId) void ensurePush(res.memberId);
       void getGeo().then(setGeo);
       setRegName('');
@@ -939,6 +1133,10 @@ export default function App() {
         return;
       }
       setMe(hit.memberId);
+      // Sinkronkan status "sudah verifikasi hari ini" milik akun BARU ini —
+      // jangan warisi status dari akun sebelumnya yang mungkin masih login
+      // di device yang sama (lihat catatan unlockKey di atas).
+      setUnlocked(sessionStorage.getItem(unlockKey(hit.memberId)) === dateStr(0));
       ting(990, 0.18); // masuk
       setToast({ msg: `Login berhasil — selamat datang, ${nama(hit.memberId)}`, kind: 'ok' });
       void ensurePush(hit.memberId);
@@ -960,7 +1158,7 @@ export default function App() {
     const a = await loadAttendance(dateStr(0), dateStr(0));
     if (a) setAtt(a);
     setUnlocked(true);
-    try { sessionStorage.setItem('piket-unlock-date', dateStr(0)); } catch { /* abaikan */ }
+    try { sessionStorage.setItem(unlockKey(me), dateStr(0)); } catch { /* abaikan */ }
     ting(990, 0.18); // absen lolos
     setToast({ msg: 'Absen berhasil — checklist & bukti terbuka', kind: 'ok' });
     void ensurePush(me);
@@ -1048,6 +1246,57 @@ export default function App() {
     };
     setState({ ...state, jam: next });
     if (state.fromApi) await saveRosterRemote(state.schedule, next);
+  };
+
+  // ---- Drag-drop jadwal minggu depan/seterusnya (weekOff !== 0) ----
+  // Pindah 1 anggota dari satu hari ke hari lain di draft lokal (belum tersimpan
+  // ke server — user masih bisa cancel). Anggota yang sama tidak boleh dobel di 1 hari.
+  const moveWeekMember = (memberId: string, fromDay: DayKey, toDay: DayKey) => {
+    if (fromDay === toDay) return;
+    setDragSchedule((prev) => {
+      if (!prev) return prev;
+      if (prev[toDay].includes(memberId)) return prev; // sudah ada di hari tujuan
+      return {
+        ...prev,
+        [fromDay]: prev[fromDay].filter((id) => id !== memberId),
+        [toDay]: [...prev[toDay], memberId],
+      };
+    });
+    setDragDirty(true);
+  };
+
+  const saveWeekDrag = async () => {
+    if (!dragSchedule) return;
+    setDragSaving(true);
+    const ok = await saveWeekRosterRemote(weekDates[0], dragSchedule, weekJamRow);
+    setDragSaving(false);
+    if (!ok) return alert('Gagal simpan (server mati / bukan Admin?).');
+    setWeekSchedule(dragSchedule);
+    setWeekOverridden(true);
+    setDragDirty(false);
+    setToast({ msg: `Jadwal minggu ${rangeLabel} tersimpan.`, kind: 'ok' });
+  };
+
+  const resetWeekDrag = () => {
+    if (!weekSchedule) return;
+    setDragSchedule(weekSchedule);
+    setDragDirty(false);
+  };
+
+  // Buang override minggu ini → kembali mengikuti template dasar.
+  const clearWeekOverride = async () => {
+    if (!confirm(`Hapus susunan khusus minggu ${rangeLabel}? Minggu ini kembali mengikuti jadwal dasar.`)) return;
+    const ok = await clearWeekRosterRemote(weekDates[0]);
+    if (!ok) return alert('Gagal (bukan Admin?).');
+    const w = await loadWeekRoster(weekDates[0]);
+    if (w) {
+      setWeekSchedule(w.schedule);
+      setWeekJamRow(w.jam);
+      setWeekOverridden(w.overridden);
+      setDragSchedule(w.schedule);
+      setDragDirty(false);
+    }
+    setToast({ msg: `Minggu ${rangeLabel} kembali ke jadwal dasar.`, kind: 'info' });
   };
 
   const gearClick = () => {
@@ -1200,8 +1449,8 @@ export default function App() {
           </button>
         )}
         <div onClick={titleTap}>
-          <h1>Ki Menwa USB YPKP</h1>
-          <p>{todayLong()} • {members.length} anggota{state && !state.fromApi ? ' • offline' : ''}</p>
+          <h1>{tabTitle[tab]}</h1>
+          <p>Ki Menwa YPKP • {members.length} anggota{state && !state.fromApi ? ' • offline' : ''}</p>
         </div>
         <div className="hbtns">
           <button className="iconbtn" onClick={gearClick} title="mode Admin"><Settings size={19} /></button>
@@ -1275,14 +1524,6 @@ export default function App() {
         )}
       </AnimatePresence>
 
-      <div className="mebar">
-        {meMember ? (
-          <span>Masuk sebagai <b>{meMember.nama}</b>{meMember.jabatan ? ` · ${meMember.jabatan}` : ''}{meMember.angkatan ? ` ${meMember.angkatan}` : ''}</span>
-        ) : (
-          <span className="hint">Belum masuk.</span>
-        )}
-      </div>
-
       <main>
         <AnimatePresence mode="wait">
           <motion.div
@@ -1334,42 +1575,60 @@ export default function App() {
                   </button>
                 )}
                 {unlocked && <p className="hint"><Check size={13} /> Wajah terverifikasi — checklist & bukti terbuka sesi ini.</p>}
-                <h2>Bukti Piket (Wajib)</h2>
-                {!unlocked && <p className="hint"><Lock size={12} /> Verifikasi wajah dulu untuk membuka bukti.</p>}
-                <ul className="tasks">
-                  {checks.map((c) => {
-                    const ph = ev.find((e) => e.tugas === c.judul);
-                    const busy = uploadingTugas === c.judul;
-                    return (
-                      <li
-                        key={c.judul}
-                        className={unlocked ? '' : 'locked'}
-                        onClick={() => taskTap(c)}
+                <div className="bdgroup">
+                  <button className="bdhead" onClick={() => setBuktiOpen((o) => !o)}>
+                    <span>Bukti Piket (Wajib)</span>
+                    <em>{ev.length}/{checks.length}</em>
+                    <ChevronDown size={16} className={buktiOpen ? 'rot' : ''} />
+                  </button>
+                  <AnimatePresence initial={false}>
+                    {buktiOpen && (
+                      <motion.div
+                        initial={{ height: 0, opacity: 0 }}
+                        animate={{ height: 'auto', opacity: 1 }}
+                        exit={{ height: 0, opacity: 0 }}
+                        transition={{ duration: 0.22, ease: 'easeOut' }}
+                        style={{ overflow: 'hidden' }}
                       >
-                        <button
-                          className="cam"
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            if (!unlocked) return needVerify();
-                            if (ph) setPreview({ file: ph.file, judul: c.judul, by: nama(ph.memberId), tanggal: dateStr(0) });
-                            else pickPhoto(c.judul);
-                          }}
-                        >
-                          {ph
-                            ? <img src={ph.file} alt={c.judul} />
-                            : busy ? <span className="spin" /> : <Camera size={17} />}
-                        </button>
-                        <span className={`ttitle ${c.done ? 'strike' : ''}`}>{c.judul}</span>
-                        <span className={`box ${c.done ? 'on' : ''}`}>{c.done ? <Check size={13} /> : ''}</span>
-                      </li>
-                    );
-                  })}
-                </ul>
-                <input
-                  ref={photoRef} type="file" accept="image/*" capture="environment" hidden
-                  onChange={(e) => { void onFile(pendingTugas ?? '', e.target.files?.[0]); e.target.value = ''; }}
-                />
-                <p className="hint">1 tugas = 1 foto (siapa pun yang piket boleh moto). Tap kamera untuk lihat/ganti, tap judul untuk centang. {ev.length}/{checks.length} berfoto.</p>
+                        {!unlocked && <p className="hint"><Lock size={12} /> Verifikasi wajah dulu untuk membuka bukti.</p>}
+                        <ul className="tasks">
+                          {checks.map((c) => {
+                            const ph = ev.find((e) => e.tugas === c.judul);
+                            const busy = uploadingTugas === c.judul;
+                            return (
+                              <li
+                                key={c.judul}
+                                className={unlocked ? '' : 'locked'}
+                                onClick={() => taskTap(c)}
+                              >
+                                <button
+                                  className="cam"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    if (!unlocked) return needVerify();
+                                    if (ph) setPreview({ file: ph.file, judul: c.judul, by: nama(ph.memberId), tanggal: dateStr(0) });
+                                    else pickPhoto(c.judul);
+                                  }}
+                                >
+                                  {ph
+                                    ? <img src={ph.file} alt={c.judul} />
+                                    : busy ? <span className="spin" /> : <Camera size={17} />}
+                                </button>
+                                <span className={`ttitle ${c.done ? 'strike' : ''}`}>{c.judul}</span>
+                                <span className={`box ${c.done ? 'on' : ''}`}>{c.done ? <Check size={13} /> : ''}</span>
+                              </li>
+                            );
+                          })}
+                        </ul>
+                        <input
+                          ref={photoRef} type="file" accept="image/*" capture="environment" hidden
+                          onChange={(e) => { void onFile(pendingTugas ?? '', e.target.files?.[0]); e.target.value = ''; }}
+                        />
+                        <p className="hint">1 tugas = 1 foto (siapa pun yang piket boleh moto). Tap kamera untuk lihat/ganti, tap judul untuk centang. {ev.length}/{checks.length} berfoto.</p>
+                      </motion.div>
+                    )}
+                  </AnimatePresence>
+                </div>
                 <h2>Rincian Tugas (Opsional)</h2>
                 <p className="hint">Tanpa foto — cukup centang, tersimpan di HP ini.</p>
                 {BREAKDOWN.map((g, gi) => {
@@ -1380,6 +1639,7 @@ export default function App() {
                       <button className="bdhead" onClick={() => setBdOpen((o) => ({ ...o, [gi]: !o[gi] }))}>
                         <span>{gi + 1}. {g.title}</span>
                         <em>{done}/{g.items.length}</em>
+                        <ChevronDown size={16} className={open ? 'rot' : ''} />
                       </button>
                       {open && (
                         <AnimatePresence initial={false}>
@@ -1455,72 +1715,88 @@ export default function App() {
                 <button onClick={() => setWeekOff((w) => w + 1)}>›</button>
               </span>
             </div>
-            {DAYS.map((d, i) => {
-              const ds = weekDates[i];
-              const isToday = ds === dateStr(0);
-              const crewIds = state?.schedule[d] ?? [];
-              return (
-                <div key={d} className={`dayrow ${isToday ? 'now' : ''}`}>
-                  <div className="dleft"><b>{ABBR[i]}</b><span>{new Date(ds + 'T00:00').getDate()}</span></div>
-                  <div className="dmain">
-                    <span className="dots">{crewIds.map((id) => <i key={id} style={{ background: warna(id) }} />)}</span>
-                    <span className="dnames">{crewIds.map(nama).join(' • ') || '—'}</span>
-                    {admin && (
-                      <span className="dedit">
-                        {crewIds.map((id) => (
-                          <button key={id} className="x" onClick={() => removeFrom(d, id)}>{nama(id)} <X size={11} /></button>
-                        ))}
-                        <button className="addbtn" onClick={() => setPickDay(pickDay === d ? null : d)}>
-                          <Plus size={13} /> Tambah personel
-                        </button>
-                        <span className="jamrow">
-                          <Clock size={13} />
-                          <label>mulai
-                            <input type="time" value={jamColon(d, 0)} onChange={(e) => void setJam(d, 'mulai', e.target.value)} />
-                          </label>
-                          <span className="dash">–</span>
-                          <label>selesai
-                            <input type="time" value={jamColon(d, 1)} onChange={(e) => void setJam(d, 'selesai', e.target.value)} />
-                          </label>
-                        </span>
-                        {pickDay === d && (
-                          <span className="picklist">
-                            {members.filter((m) => !crewIds.includes(m.id)).map((m) => (
-                              <button key={m.id} onClick={() => void addTo(d, m.id)}>
-                                {m.foto
-                                  ? <img className="ava" src={m.foto} alt={m.nama} />
-                                  : <i className="pdot" style={{ background: m.warna }} />}
-                                <span>{m.nama}{m.jabatan ? <small> · {m.jabatan}</small> : ''}</span>
-                                <Plus size={14} />
-                              </button>
-                            ))}
-                            {members.filter((m) => !crewIds.includes(m.id)).length === 0 && (
-                              <span className="hint">Semua anggota sudah di hari ini.</span>
-                            )}
+            {admin && weekOff !== 0 ? (
+              <WeekDragBoard
+                weekLoading={weekLoading}
+                dragSchedule={dragSchedule}
+                dragDirty={dragDirty}
+                dragSaving={dragSaving}
+                weekOverridden={weekOverridden}
+                weekDates={weekDates}
+                members={members}
+                onMove={moveWeekMember}
+                onSave={saveWeekDrag}
+                onReset={resetWeekDrag}
+                onClearOverride={clearWeekOverride}
+              />
+            ) : (
+              DAYS.map((d, i) => {
+                const ds = weekDates[i];
+                const isToday = ds === dateStr(0);
+                const crewIds = state?.schedule[d] ?? [];
+                return (
+                  <div key={d} className={`dayrow ${isToday ? 'now' : ''}`}>
+                    <div className="dleft"><b>{ABBR[i]}</b><span>{new Date(ds + 'T00:00').getDate()}</span></div>
+                    <div className="dmain">
+                      <span className="dots">{crewIds.map((id) => <i key={id} style={{ background: warna(id) }} />)}</span>
+                      <span className="dnames">{crewIds.map(nama).join(' • ') || '—'}</span>
+                      {admin && (
+                        <span className="dedit">
+                          {crewIds.map((id) => (
+                            <button key={id} className="x" onClick={() => removeFrom(d, id)}>{nama(id)} <X size={11} /></button>
+                          ))}
+                          <button className="addbtn" onClick={() => setPickDay(pickDay === d ? null : d)}>
+                            <Plus size={13} /> Tambah personel
+                          </button>
+                          <span className="jamrow">
+                            <Clock size={13} />
+                            <label>mulai
+                              <input type="time" value={jamColon(d, 0)} onChange={(e) => void setJam(d, 'mulai', e.target.value)} />
+                            </label>
+                            <span className="dash">–</span>
+                            <label>selesai
+                              <input type="time" value={jamColon(d, 1)} onChange={(e) => void setJam(d, 'selesai', e.target.value)} />
+                            </label>
                           </span>
-                        )}
-                      </span>
-                    )}
-                    {(weekEv[ds] ?? []).length > 0 && (
-                      <span className="dayph">
-                        {(weekEv[ds] ?? []).map((e) => (
-                          <img
-                            key={e.id} src={e.file} alt={e.tugas}
-                            onClick={() => setPreview({ file: e.file, judul: e.tugas, by: nama(e.memberId), tanggal: ds })}
-                          />
-                        ))}
-                      </span>
-                    )}
+                          {pickDay === d && (
+                            <span className="picklist">
+                              {members.filter((m) => !crewIds.includes(m.id)).map((m) => (
+                                <button key={m.id} onClick={() => void addTo(d, m.id)}>
+                                  {m.foto
+                                    ? <img className="ava" src={m.foto} alt={m.nama} />
+                                    : <i className="pdot" style={{ background: m.warna }} />}
+                                  <span>{m.nama}{m.jabatan ? <small> · {m.jabatan}</small> : ''}</span>
+                                  <Plus size={14} />
+                                </button>
+                              ))}
+                              {members.filter((m) => !crewIds.includes(m.id)).length === 0 && (
+                                <span className="hint">Semua anggota sudah di hari ini.</span>
+                              )}
+                            </span>
+                          )}
+                        </span>
+                      )}
+                      {(weekEv[ds] ?? []).length > 0 && (
+                        <span className="dayph">
+                          {(weekEv[ds] ?? []).map((e) => (
+                            <img
+                              key={e.id} src={e.file} alt={e.tugas}
+                              onClick={() => setPreview({ file: e.file, judul: e.tugas, by: nama(e.memberId), tanggal: ds })}
+                            />
+                          ))}
+                        </span>
+                      )}
+                    </div>
+                    {swappedDays.has(d) && <em className="swapmark" title="hari ini hasil tukar jadwal"><ArrowLeftRight size={12} /></em>}
+                    {isToday
+                      ? <em className="pill sm">hari ini</em>
+                      : weekStat[ds]
+                        ? <em className="badge-ok"><Check size={11} /> selesai</em>
+                        : <em className="badge-idle" />}
                   </div>
-                  {swappedDays.has(d) && <em className="swapmark" title="hari ini hasil tukar jadwal"><ArrowLeftRight size={12} /></em>}
-                  {isToday
-                    ? <em className="pill sm">hari ini</em>
-                    : weekStat[ds]
-                      ? <em className="badge-ok"><Check size={11} /> selesai</em>
-                      : <em className="badge-idle" />}
-                </div>
-              );
-            })}
+                );
+              })
+            )}
             {approvedSwaps.length > 0 && (
               <div className="swaplog">
                 <b>Hasil tukar jadwal</b>

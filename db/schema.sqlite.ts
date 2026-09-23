@@ -23,6 +23,11 @@ export const roster = sqliteTable('roster', {
     .references(() => members.id),
   jamMulai: text('jam_mulai').notNull().default('09.00'),
   jamSelesai: text('jam_selesai').notNull().default('15.00'),
+  // Senin dari minggu ybs (YYYY-MM-DD), NULL = default/template berulang.
+  // Ada baris dgn weekStart tertentu → override KHUSUS minggu itu (dipakai
+  // drag-drop di tab Mingguan: geser jadwal minggu depan/seterusnya tanpa
+  // mengubah template dasar).
+  weekStart: text('week_start'),
 });
 
 // Checklist per tanggal. Baris bertanggal 'template' = master tugas harian,

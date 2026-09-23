@@ -1,5 +1,5 @@
 import cors from 'cors';
-import { eq } from 'drizzle-orm';
+import { and, eq, isNull } from 'drizzle-orm';
 import express from 'express';
 import fs from 'node:fs';
 import { createHash } from 'node:crypto';
@@ -111,7 +111,7 @@ app.get('/api/state', (_req, res) => {
   });
 });
 
-// ---- roster (admin ganti jadwal + jam) ----
+// ---- roster (admin ganti jadwal + jam) — template dasar berulang tiap minggu ----
 app.put('/api/roster', requireAdmin, (req, res) => {
   const rows = req.body.roster as { day: string; memberId: string; jamMulai?: string; jamSelesai?: string }[];
   if (!Array.isArray(rows)) return void res.status(400).json({ error: 'roster harus array' });
@@ -126,7 +126,8 @@ app.put('/api/roster', requireAdmin, (req, res) => {
     }
   }
   db.transaction((tx) => {
-    tx.delete(roster).run();
+    // Hanya hapus baris TEMPLATE (weekStart null) — override per-minggu tidak boleh ikut kehapus.
+    tx.delete(roster).where(isNull(roster.weekStart)).run();
     for (const r of rows) {
       tx.insert(roster).values({
         day: r.day, memberId: r.memberId,
@@ -134,6 +135,57 @@ app.put('/api/roster', requireAdmin, (req, res) => {
       }).run();
     }
   });
+  res.json({ ok: true });
+});
+
+// ---- roster per-minggu (drag-drop tab Mingguan): override khusus 1 minggu ----
+// Baca jadwal EFEKTIF minggu tsb: kalau minggu itu punya override tersimpan,
+// pakai override; kalau tidak, fallback ke template dasar (weekStart null).
+app.get('/api/roster/week', (req, res) => {
+  const start = String(req.query.start ?? '');
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(start)) return void res.status(400).json({ error: 'start=YYYY-MM-DD (Senin minggu ybs)' });
+  const overrideRows = db.select().from(roster).where(eq(roster.weekStart, start)).all();
+  const rows = overrideRows.length > 0
+    ? overrideRows
+    : db.select().from(roster).where(isNull(roster.weekStart)).all();
+  res.json({ roster: rows, overridden: overrideRows.length > 0 });
+});
+
+// Simpan hasil drag-drop untuk 1 minggu spesifik (tidak menyentuh template dasar
+// ataupun override minggu lain).
+app.put('/api/roster/week', requireAdmin, (req, res) => {
+  const start = String(req.body.start ?? '');
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(start)) return void res.status(400).json({ error: 'start=YYYY-MM-DD (Senin minggu ybs)' });
+  const rows = req.body.roster as { day: string; memberId: string; jamMulai?: string; jamSelesai?: string }[];
+  if (!Array.isArray(rows)) return void res.status(400).json({ error: 'roster harus array' });
+  for (const r of rows) {
+    if (!DAYS.includes(r.day as (typeof DAYS)[number])) return void res.status(400).json({ error: `hari invalid: ${r.day}` });
+  }
+  const ids = db.select({ id: members.id }).from(members).all().map((m) => m.id);
+  for (const r of rows) {
+    if (!ids.includes(r.memberId)) return void res.status(400).json({ error: `anggota tidak dikenal: ${r.memberId}` });
+    for (const j of [r.jamMulai ?? '09.00', r.jamSelesai ?? '15.00']) {
+      if (!/^\d{2}\.\d{2}$/.test(j)) return void res.status(400).json({ error: `jam invalid: ${j}` });
+    }
+  }
+  db.transaction((tx) => {
+    tx.delete(roster).where(eq(roster.weekStart, start)).run();
+    for (const r of rows) {
+      tx.insert(roster).values({
+        day: r.day, memberId: r.memberId,
+        jamMulai: r.jamMulai ?? '09.00', jamSelesai: r.jamSelesai ?? '15.00',
+        weekStart: start,
+      }).run();
+    }
+  });
+  res.json({ ok: true });
+});
+
+// Buang override 1 minggu → kembali mengikuti template dasar lagi.
+app.delete('/api/roster/week', requireAdmin, (req, res) => {
+  const start = String(req.query.start ?? '');
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(start)) return void res.status(400).json({ error: 'start=YYYY-MM-DD (Senin minggu ybs)' });
+  db.delete(roster).where(eq(roster.weekStart, start)).run();
   res.json({ ok: true });
 });
 
@@ -192,9 +244,10 @@ app.post('/api/swaps/:id/decide', (req, res) => {
   void sendPush(row.requester, approve ? 'Tukar disetujui' : 'Tukar ditolak',
     `${memberName(row.target)} ${approve ? 'menerima' : 'menolak'} tukar: ${row.fromDay} ⇄ ${row.toDay}`, '/#tukar');
   if (approve) {
-    // tukar 1 orang antar dua hari
-    const fromRows = db.select().from(roster).where(eq(roster.day, row.fromDay)).all();
-    const toRows = db.select().from(roster).where(eq(roster.day, row.toDay)).all();
+    // Tukar 1 orang antar dua hari — hanya di TEMPLATE dasar (minggu berjalan
+    // ikut default). Override minggu depan/lain (hasil drag-drop) tidak disentuh.
+    const fromRows = db.select().from(roster).where(and(eq(roster.day, row.fromDay), isNull(roster.weekStart))).all();
+    const toRows = db.select().from(roster).where(and(eq(roster.day, row.toDay), isNull(roster.weekStart))).all();
     for (const r of fromRows.filter((x) => x.memberId === row.requester)) {
       db.update(roster).set({ memberId: row.target }).where(eq(roster.id, r.id)).run();
     }

@@ -239,6 +239,64 @@ export async function saveRosterRemote(
   }
 }
 
+// ---- roster per-minggu (drag-drop tab Mingguan: minggu depan/seterusnya) ----
+export interface WeekRosterRow { day: DayKey; memberId: string; jamMulai: string; jamSelesai: string }
+
+// weekStart = tanggal Senin minggu ybs (YYYY-MM-DD). Fallback ke template dasar
+// bila minggu itu belum pernah di-drag-drop (overridden:false).
+export async function loadWeekRoster(
+  weekStart: string,
+): Promise<{ schedule: Record<DayKey, string[]>; jam: Record<DayKey, string>; overridden: boolean } | null> {
+  const s = await get<{ roster: WeekRosterRow[]; overridden: boolean }>(`/api/roster/week?start=${weekStart}`);
+  if (!s) return null;
+  const schedule = { Senin: [], Selasa: [], Rabu: [], Kamis: [], Jumat: [] } as Record<DayKey, string[]>;
+  const jam = {} as Record<DayKey, string>;
+  for (const r of s.roster) {
+    schedule[r.day].push(r.memberId);
+    jam[r.day] = `${r.jamMulai}–${r.jamSelesai}`;
+  }
+  return { schedule, jam, overridden: s.overridden };
+}
+
+// Simpan hasil drag-drop untuk 1 minggu spesifik — tidak mengubah template dasar.
+export async function saveWeekRosterRemote(
+  weekStart: string, schedule: Record<DayKey, string[]>, jam?: Record<DayKey, string>,
+): Promise<boolean> {
+  try {
+    const roster = Object.entries(schedule).flatMap(([day, ids]) => {
+      const [jamMulai, jamSelesai] = (jam?.[day as DayKey] ?? '09.00–15.00').split('–');
+      return (ids as string[]).map((memberId) => ({
+        day, memberId,
+        jamMulai: jamMulai ?? '09.00', jamSelesai: jamSelesai ?? '15.00',
+      }));
+    });
+    const r = await fetch('/api/roster/week', {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(getPin() ? { 'x-admin-pin': getPin() as string } : {}),
+      },
+      body: JSON.stringify({ start: weekStart, roster }),
+    });
+    return r.ok;
+  } catch {
+    return false;
+  }
+}
+
+// Buang override 1 minggu → minggu itu kembali mengikuti template dasar.
+export async function clearWeekRosterRemote(weekStart: string): Promise<boolean> {
+  try {
+    const r = await fetch(`/api/roster/week?start=${weekStart}`, {
+      method: 'DELETE',
+      headers: { ...(getPin() ? { 'x-admin-pin': getPin() as string } : {}) },
+    });
+    return r.ok;
+  } catch {
+    return false;
+  }
+}
+
 // ---- wajah & absen ----
 export interface FaceRow {
   memberId: string;
