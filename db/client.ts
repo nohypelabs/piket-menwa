@@ -88,38 +88,34 @@ CREATE TABLE IF NOT EXISTS tugas_master (
   no INTEGER PRIMARY KEY, kategori TEXT NOT NULL, judul TEXT NOT NULL UNIQUE,
   bobot INTEGER NOT NULL, jenis TEXT NOT NULL, foto_wajib INTEGER NOT NULL DEFAULT 0
 );
-CREATE TABLE IF NOT EXISTS assessments (
-  id INTEGER PRIMARY KEY AUTOINCREMENT, tanggal TEXT NOT NULL,
-  member_id TEXT NOT NULL REFERENCES members(id),
-  status TEXT NOT NULL DEFAULT 'draft', nilai REAL,
-  submitted_at INTEGER, verified_by TEXT, verified_at INTEGER
-);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_assess_uniq ON assessments(tanggal, member_id);
-CREATE TABLE IF NOT EXISTS assessment_items (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  assessment_id INTEGER NOT NULL REFERENCES assessments(id),
-  no INTEGER NOT NULL, kategori TEXT NOT NULL, judul TEXT NOT NULL,
-  bobot INTEGER NOT NULL, jenis TEXT NOT NULL,
-  foto_wajib INTEGER NOT NULL DEFAULT 0,
-  status TEXT NOT NULL DEFAULT 'tidak', done_by TEXT,
-  CONSTRAINT chk_item_na CHECK (jenis='Kondisional' OR status != 'na')
-);
-CREATE TABLE IF NOT EXISTS item_koreksi (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  item_id INTEGER NOT NULL REFERENCES assessment_items(id),
-  status_lama TEXT NOT NULL, status_baru TEXT NOT NULL,
-  catatan TEXT NOT NULL, by TEXT NOT NULL, at INTEGER NOT NULL
-);
-CREATE TABLE IF NOT EXISTS kehadiran (
-  id INTEGER PRIMARY KEY AUTOINCREMENT, tanggal TEXT NOT NULL,
-  member_id TEXT NOT NULL REFERENCES members(id),
-  status TEXT NOT NULL DEFAULT 'hadir', acc TEXT, by TEXT, at INTEGER NOT NULL
-);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_hadir_uniq ON kehadiran(tanggal, member_id);
 CREATE TABLE IF NOT EXISTS settings (
   key TEXT PRIMARY KEY, value TEXT NOT NULL
 );
 `);
+
+// Hapus jalur verifikasi-manual (assessments dkk): satu-satunya sistem nilai
+// yang berlaku adalah otomatis real-time. DROP aman (FK sudah dibersihkan
+// berurutan: koreksi → items → assessments, lalu kehadiran).
+try {
+  const legacy = (sqlite.prepare(
+    "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('assessments','assessment_items','item_koreksi','kehadiran')",
+  ).all() as { name: string }[]).map((r) => r.name);
+  if (legacy.length > 0) {
+    sqlite.exec(`DELETE FROM item_koreksi;
+      DELETE FROM assessment_items;
+      DELETE FROM assessments;
+      DELETE FROM kehadiran;
+      DROP TABLE IF EXISTS item_koreksi;
+      DROP TABLE IF EXISTS assessment_items;
+      DROP TABLE IF EXISTS assessments;
+      DROP TABLE IF EXISTS kehadiran;
+      DROP INDEX IF EXISTS idx_assess_uniq;
+      DROP INDEX IF EXISTS idx_hadir_uniq;`);
+    console.log('migrasi hapus jalur nilai-manual ok');
+  }
+} catch (e) {
+  console.warn('migrasi hapus nilai-manual gagal:', (e as Error).message);
+}
 
 // Migrasi DB lama (evidence per-anggota selfie/tugas) → per-tugas. Dev-only.
 try {

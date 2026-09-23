@@ -105,16 +105,15 @@ Autentikasi aksi sensitif: identitas member dari sesi login; admin pakai header 
 ## 📁 Struktur Project
 
 ```
-├── src/                # React app (App, Welcome wizard, Super dashboard, FaceCam…)
+├── src/                # React app — App.tsx cuma composition root (DevWay)
+│   ├── hooks/useAppStore.ts  # seluruh state + handler (satu store eksplisit)
+│   ├── tabs/           # HariTab, MingguanTab, TukarTab (presentasional)
+│   ├── components/     # Toast, FaceCam, WeekDragBoard, BottomTabs,
+│   │                   # PinSheet, LogoutSheet, PhotoPreview, ConfirmIdentity…
 │   ├── face.ts         # loader model + geometri yaw + audio ting
 │   ├── bukti.ts        # kompres WebP ≤40KB + stempel watermark + geo
 │   ├── api.ts          # client API + fallback offline (localStorage)
 │   └── sw.ts           # service worker: precache, cache foto, push handler
-├── server/             # Express REST API (+ seed)
-├── db/                 # Drizzle schema sqlite + pg mirror, enkripsi, face-match
-├── public/brand/       # taruh logo organisasi di logo-menwa.png…
-├── scripts/gen-icons.py# …lalu generate semua ikon PWA/TWA dari 1 file
-└── drizzle.config.ts   # dev: sqlite. Produksi: ganti ke config postgres
 ```
 
 ### 🎨 Ganti Brand Organisasi Lain
